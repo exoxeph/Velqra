@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/velqra-protocol", "crates/velqra-core", "crates/velqra-sim"]
+members = [
+    "crates/velqra-protocol",
+    "crates/velqra-core",
+    "crates/velqra-sim",
+    "crates/velqra-bridge",
+    "crates/velqra-ipc",
+    "crates/velqra-app",
+]
 
 [workspace.package]
 version = "0.0.1"
@@ -12,9 +19,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
 sha2 = "0.10"
+hmac = "0.12"
+windows-sys = "0.61"
 rusqlite = { version = "0.31", features = ["bundled"] }
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
 proptest = "1"
 tempfile = "3"
 velqra-protocol = { path = "crates/velqra-protocol" }
 velqra-core = { path = "crates/velqra-core" }
+velqra-bridge = { path = "crates/velqra-bridge" }
+velqra-ipc = { path = "crates/velqra-ipc" }

@@ -1,0 +1,158 @@
+{
+  "base64": [
+    {
+      "encoded": "",
+      "plain": ""
+    },
+    {
+      "encoded": "Zg==",
+      "plain": "f"
+    },
+    {
+      "encoded": "Zm8=",
+      "plain": "fo"
+    },
+    {
+      "encoded": "Zm9v",
+      "plain": "foo"
+    },
+    {
+      "encoded": "Zm9vYg==",
+      "plain": "foob"
+    },
+    {
+      "encoded": "Zm9vYmE=",
+      "plain": "fooba"
+    },
+    {
+      "encoded": "Zm9vYmFy",
+      "plain": "foobar"
+    }
+  ],
+  "client_mac_b64": "LdryoTG5KbUB6cid/XbVktSTUIwW77r4+5x061GXKrc=",
+  "cn_b64": "AQEBAQEBAQEBAQEBAQEBAQ==",
+  "core_b64": "AwMDAwMDAwMDAwMDAwMDAw==",
+  "envelopes": {
+    "abort": {
+      "body": {
+        "payload": {
+          "receipt": {
+            "fingerprint": "abababababababababababababababababababababababababababababababab",
+            "task_id": 7
+          }
+        },
+        "type": "abort"
+      },
+      "generation": 1,
+      "message_id": "m4",
+      "request_id": "req-1",
+      "session_id": "0123456789abcdef0123456789abcdef",
+      "version": 1
+    },
+    "abort_unknown": {
+      "body": {
+        "payload": {
+          "receipt": null
+        },
+        "type": "abort"
+      },
+      "generation": 1,
+      "message_id": "m5",
+      "request_id": "req-1",
+      "session_id": "0123456789abcdef0123456789abcdef",
+      "version": 1
+    },
+    "begin_handoff": {
+      "body": {
+        "payload": {
+          "fingerprint": "abababababababababababababababababababababababababababababababab",
+          "task_id": 7
+        },
+        "type": "begin_handoff"
+      },
+      "generation": 1,
+      "message_id": "m2",
+      "request_id": "req-1",
+      "session_id": "0123456789abcdef0123456789abcdef",
+      "version": 1
+    },
+    "commit": {
+      "body": {
+        "payload": {
+          "cancel": "confirmed",
+          "receipt": {
+            "fingerprint": "abababababababababababababababababababababababababababababababab",
+            "task_id": 7
+          }
+        },
+        "type": "commit"
+      },
+      "generation": 1,
+      "message_id": "m3",
+      "request_id": "req-1",
+      "session_id": "0123456789abcdef0123456789abcdef",
+      "version": 1
+    },
+    "health": {
+      "body": {
+        "payload": {},
+        "type": "health"
+      },
+      "generation": 1,
+      "message_id": "m8",
+      "request_id": "req-1",
+      "session_id": "0123456789abcdef0123456789abcdef",
+      "version": 1
+    },
+    "prepare": {
+      "body": {
+        "payload": {
+          "context": "ctx",
+          "download_key": "d1",
+          "filename": "a.zip",
+          "url": "https://x.test/a.zip"
+        },
+        "type": "prepare"
+      },
+      "generation": 1,
+      "message_id": "m1",
+      "request_id": "req-1",
+      "session_id": "0123456789abcdef0123456789abcdef",
+      "version": 1
+    },
+    "reconcile": {
+      "body": {
+        "payload": {
+          "owner": "unknown",
+          "receipt": {
+            "fingerprint": "abababababababababababababababababababababababababababababababab",
+            "task_id": 7
+          }
+        },
+        "type": "reconcile"
+      },
+      "generation": 1,
+      "message_id": "m6",
+      "request_id": "req-1",
+      "session_id": "0123456789abcdef0123456789abcdef",
+      "version": 1
+    },
+    "status": {
+      "body": {
+        "payload": {},
+        "type": "status"
+      },
+      "generation": 1,
+      "message_id": "m7",
+      "request_id": "req-1",
+      "session_id": "0123456789abcdef0123456789abcdef",
+      "version": 1
+    }
+  },
+  "hmac_rfc4231_case2_hex": "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843",
+  "origin": "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/",
+  "secret_b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+  "server_mac_b64": "q2niH0SZ1BpQiieYqnFr+fHJPZzpyq8clSwan2KAL1A=",
+  "server_transcript_b64": "AAAAEHZlbHFyYS92MS9zZXJ2ZXIAAAAQAQEBAQEBAQEBAQEBAQEBAQAAABACAgICAgICAgICAgICAgICAAAANGNocm9tZS1leHRlbnNpb246Ly9hYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYS8AAAAQAwMDAwMDAwMDAwMDAwMDAwAB",
+  "sn_b64": "AgICAgICAgICAgICAgICAg=="
+}

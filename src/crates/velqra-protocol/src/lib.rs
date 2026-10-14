@@ -102,6 +102,14 @@ pub struct ReconcileBody {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Empty {}
 
+/// Answer to a health check: which core answered and what it speaks. Nothing secret.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthInfo {
+    pub core_instance: String,
+    pub versions: Vec<u16>,
+    pub engine: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorKind {
@@ -121,6 +129,8 @@ pub enum ErrorKind {
     Aborted,
     Storage,
     IdentityMismatch,
+    Overloaded,
+    Unauthenticated,
 }
 
 /// The detail travels on the wire but is untrusted text: it is never printed.
@@ -165,6 +175,8 @@ pub enum Message {
     Reconciled(Receipt),
     Status(Empty),
     StatusReply(Receipt),
+    Health(Empty),
+    HealthReply(HealthInfo),
     Error(ProtoError),
 }
 
@@ -183,6 +195,8 @@ impl Message {
             Message::Reconciled(_) => "reconciled",
             Message::Status(_) => "status",
             Message::StatusReply(_) => "status_reply",
+            Message::Health(_) => "health",
+            Message::HealthReply(_) => "health_reply",
             Message::Error(_) => "error",
         }
     }
@@ -318,6 +332,82 @@ fn check_ref(r: &RequestRef) -> Result<(), ProtoError> {
     Ok(())
 }
 
+/// A JSON value that refuses duplicate object keys at any depth (serde_json::Value keeps the last one,
+/// which would let two parsers disagree about what a message says).
+struct StrictValue(serde_json::Value);
+
+impl<'de> Deserialize<'de> for StrictValue {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::{Error, MapAccess, SeqAccess, Visitor};
+        use serde_json::{Map, Number, Value};
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Value;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a json value")
+            }
+            fn visit_bool<E>(self, v: bool) -> Result<Value, E> {
+                Ok(Value::Bool(v))
+            }
+            fn visit_i64<E>(self, v: i64) -> Result<Value, E> {
+                Ok(Value::Number(v.into()))
+            }
+            fn visit_u64<E>(self, v: u64) -> Result<Value, E> {
+                Ok(Value::Number(v.into()))
+            }
+            fn visit_f64<E: Error>(self, v: f64) -> Result<Value, E> {
+                Number::from_f64(v)
+                    .map(Value::Number)
+                    .ok_or_else(|| E::custom("number"))
+            }
+            fn visit_str<E>(self, v: &str) -> Result<Value, E> {
+                Ok(Value::String(v.to_owned()))
+            }
+            fn visit_string<E>(self, v: String) -> Result<Value, E> {
+                Ok(Value::String(v))
+            }
+            fn visit_unit<E>(self) -> Result<Value, E> {
+                Ok(Value::Null)
+            }
+            fn visit_none<E>(self) -> Result<Value, E> {
+                Ok(Value::Null)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> Result<Value, A::Error> {
+                let mut out = Vec::new();
+                while let Some(StrictValue(v)) = a.next_element()? {
+                    out.push(v);
+                }
+                Ok(Value::Array(out))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> Result<Value, A::Error> {
+                let mut out = Map::new();
+                while let Some((k, StrictValue(v))) = a.next_entry::<String, StrictValue>()? {
+                    if out.insert(k, v).is_some() {
+                        // fixed text: the offending key is never echoed
+                        return Err(A::Error::custom("duplicate key"));
+                    }
+                }
+                Ok(Value::Object(out))
+            }
+        }
+        d.deserialize_any(V).map(StrictValue)
+    }
+}
+
+/// Size, syntax, duplicate-key and nesting checks shared by every untrusted JSON input
+/// (envelopes and the pre-session handshake frames). Errors are fixed text.
+pub fn parse_strict_json(bytes: &[u8]) -> Result<serde_json::Value, ProtoError> {
+    if bytes.len() > MAX_ENVELOPE_BYTES {
+        return Err(ProtoError::new(ErrorKind::TooLarge, "envelope too large"));
+    }
+    let StrictValue(value) = serde_json::from_slice(bytes)
+        .map_err(|_| ProtoError::new(ErrorKind::Malformed, "input is not valid json"))?;
+    if depth(&value) > MAX_JSON_DEPTH {
+        return Err(ProtoError::new(ErrorKind::TooDeep, "json nesting too deep"));
+    }
+    Ok(value)
+}
+
 impl Envelope {
     /// Full validation of a typed envelope. The wire decoder calls this, and the core calls it
     /// again so typed callers cannot bypass it.
@@ -386,14 +476,7 @@ impl Envelope {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Envelope, ProtoError> {
-        if bytes.len() > MAX_ENVELOPE_BYTES {
-            return Err(ProtoError::new(ErrorKind::TooLarge, "envelope too large"));
-        }
-        let value: serde_json::Value = serde_json::from_slice(bytes)
-            .map_err(|_| ProtoError::new(ErrorKind::Malformed, "input is not valid json"))?;
-        if depth(&value) > MAX_JSON_DEPTH {
-            return Err(ProtoError::new(ErrorKind::TooDeep, "json nesting too deep"));
-        }
+        let value = parse_strict_json(bytes)?;
         if value.get("version").and_then(|v| v.as_u64()) != Some(PROTOCOL_VERSION as u64) {
             return Err(ProtoError::new(
                 ErrorKind::BadVersion,
@@ -693,5 +776,118 @@ mod tests {
             body: Message::Error(e),
         };
         assert!(!format!("{env:?}").contains("URLSECRET"));
+    }
+
+    fn status_json() -> String {
+        let env = Envelope {
+            version: PROTOCOL_VERSION,
+            message_id: "m1".into(),
+            session_id: "s1".into(),
+            request_id: "r1".into(),
+            generation: 1,
+            body: Message::Status(Empty {}),
+        };
+        String::from_utf8(env.encode().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn duplicate_keys_are_rejected_at_every_depth() {
+        let ok = status_json();
+        assert!(Envelope::decode(ok.as_bytes()).is_ok());
+        // top level
+        let dup = ok.replacen('{', "{\"generation\":2,", 1);
+        let e = Envelope::decode(dup.as_bytes()).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Malformed);
+        // inside the payload object
+        let dup = ok.replace("\"payload\":{}", "\"payload\":{\"x\":1,\"x\":2}");
+        assert_ne!(dup, ok, "fixture did not contain an empty payload");
+        assert_eq!(
+            Envelope::decode(dup.as_bytes()).unwrap_err().kind,
+            ErrorKind::Malformed
+        );
+        // nested two levels down
+        let dup = ok.replace(
+            "\"payload\":{}",
+            "\"payload\":{\"a\":{\"b\":{\"k\":1,\"k\":1}}}",
+        );
+        assert_eq!(
+            Envelope::decode(dup.as_bytes()).unwrap_err().kind,
+            ErrorKind::Malformed
+        );
+    }
+
+    #[test]
+    fn duplicate_key_errors_do_not_echo_the_key() {
+        let ok = status_json();
+        let dup = ok.replacen('{', "{\"S3CR3T-KEY\":1,\"S3CR3T-KEY\":2,", 1);
+        let e = Envelope::decode(dup.as_bytes()).unwrap_err();
+        assert!(!format!("{e:?}{e}").contains("S3CR3T-KEY"));
+        assert!(!e.detail.contains("S3CR3T-KEY"));
+    }
+
+    #[test]
+    fn health_messages_round_trip_and_have_kinds() {
+        let info = HealthInfo {
+            core_instance: "c1".into(),
+            versions: vec![1],
+            engine: "fake".into(),
+        };
+        for body in [Message::Health(Empty {}), Message::HealthReply(info)] {
+            let env = Envelope {
+                version: PROTOCOL_VERSION,
+                message_id: "m".into(),
+                session_id: "s".into(),
+                request_id: "r".into(),
+                generation: 1,
+                body: body.clone(),
+            };
+            let back = Envelope::decode(&env.encode().unwrap()).unwrap();
+            assert_eq!(back.body, body);
+        }
+        assert_eq!(Message::Health(Empty {}).kind(), "health");
+        assert_eq!(
+            Message::HealthReply(HealthInfo {
+                core_instance: String::new(),
+                versions: vec![],
+                engine: String::new()
+            })
+            .kind(),
+            "health_reply"
+        );
+    }
+
+    #[test]
+    fn new_error_kinds_use_snake_case_on_the_wire() {
+        let e = ProtoError::new(ErrorKind::Overloaded, "x");
+        assert!(serde_json::to_string(&e)
+            .unwrap()
+            .contains("\"overloaded\""));
+        let e = ProtoError::new(ErrorKind::Unauthenticated, "x");
+        assert!(serde_json::to_string(&e)
+            .unwrap()
+            .contains("\"unauthenticated\""));
+    }
+
+    #[test]
+    fn parse_strict_json_rejects_duplicates_depth_and_size() {
+        assert!(parse_strict_json(b"{\"a\":1,\"b\":[1,2]}").is_ok());
+        assert_eq!(
+            parse_strict_json(b"{\"a\":1,\"a\":2}").unwrap_err().kind,
+            ErrorKind::Malformed
+        );
+        let deep = format!("{}1{}", "[".repeat(20), "]".repeat(20));
+        assert_eq!(
+            parse_strict_json(deep.as_bytes()).unwrap_err().kind,
+            ErrorKind::TooDeep
+        );
+        let big = vec![b' '; MAX_ENVELOPE_BYTES + 1];
+        assert_eq!(
+            parse_strict_json(&big).unwrap_err().kind,
+            ErrorKind::TooLarge
+        );
+        assert_eq!(
+            parse_strict_json(&[0xff, 0xfe]).unwrap_err().kind,
+            ErrorKind::Malformed
+        );
     }
 }

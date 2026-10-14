@@ -1,0 +1,16 @@
+[package]
+name = "velqra-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+velqra-protocol.workspace = true
+velqra-core.workspace = true
+velqra-bridge.workspace = true
+velqra-ipc.workspace = true
+serde_json.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
