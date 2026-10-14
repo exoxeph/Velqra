@@ -1,0 +1,15 @@
+[package]
+name = "velqra-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+velqra-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+rusqlite.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

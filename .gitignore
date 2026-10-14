@@ -1,0 +1,39 @@
+# Velqra: only working product code is committed. Research, plans and agent files stay local.
+
+# All markdown (CLAUDE.md, AGENTS.md, plan.md, reports, handoffs, docs)
+*.md
+
+# Research / evidence / coordination directories
+/benchmark/
+/browser/
+/runtime/
+/static-analysis/
+/reports/
+/handoffs/
+/docs/
+
+# Research artifacts and tool state
+*.zip
+*.har
+*.pml
+*.jsonl
+.claude/
+.codex/
+.rea/
+
+# Never commit IDM files, dumps or captures
+IDMan*
+extension-dump/
+
+# General
+node_modules/
+__pycache__/
+*.pyc
+.env
+.env.*
+dist/
+build/
+*.log
+.vscode/
+.idea/
+Thumbs.db

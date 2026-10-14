@@ -1,0 +1,18 @@
+[package]
+name = "velqra-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+velqra-protocol.workspace = true
+velqra-core.workspace = true
+rand.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[bin]]
+name = "velqra-sim"
+path = "src/main.rs"
