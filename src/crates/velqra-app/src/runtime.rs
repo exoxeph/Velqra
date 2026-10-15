@@ -5,7 +5,12 @@
 //! Queues are bounded everywhere. A connection whose queue fills up is dropped, never buffered
 //! without limit. Nothing that came from outside is ever formatted into a log line.
 
-use crate::paths::{db_path, ensure_secret};
+use crate::aria2::adapter::Aria2Config;
+use crate::aria2::process::{Launch, PINNED_ARIA2_SHA256};
+use crate::aria2::supervisor::Aria2Supervisor;
+use crate::guard::Guarded;
+use crate::paths::{db_path, ensure_secret, settings_path, vault_dir};
+use crate::protector::UserProtector;
 use rand::rngs::{OsRng, StdRng};
 use rand::SeedableRng;
 use std::collections::HashMap;
@@ -18,6 +23,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use velqra_bridge::backend::CoreBackend;
 use velqra_bridge::server::{Action, BridgeServer, ConnId};
+use velqra_core::file_vault::FileVault;
+use velqra_core::settings::Settings;
 use velqra_core::store::SqliteStore;
 use velqra_core::{Core, Engine, EngineError, EngineRequest};
 use velqra_ipc::{Connection, PipeServer};
@@ -29,16 +36,30 @@ pub struct RuntimeConfig {
     pub home: PathBuf,
     pub pipe: String,
     pub allowed: Vec<String>,
+    /// Used when `settings.json` names no destination folder.
+    pub download_root: PathBuf,
+    /// The pinned aria2 executable; without it the loopback stand-in engine is used (development).
+    pub aria2: Option<PathBuf>,
     /// Length of one server tick in milliseconds (100 in production; tests shorten it).
     pub tick_ms: u64,
 }
 
 impl RuntimeConfig {
     pub fn from_env() -> io::Result<Self> {
+        let home = crate::paths::home_dir()?;
+        let download_root = crate::paths::default_download_root(
+            std::env::var("VELQRA_HOME").ok().as_deref(),
+            std::env::var("USERPROFILE").ok().as_deref(),
+            &home,
+        );
         Ok(Self {
-            home: crate::paths::home_dir()?,
+            home,
             pipe: crate::paths::pipe_name()?,
             allowed: crate::paths::allowed_origins(),
+            download_root,
+            aria2: std::env::var_os("VELQRA_ARIA2")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from),
             tick_ms: 100,
         })
     }
@@ -75,16 +96,33 @@ pub struct Runtime {
 impl Runtime {
     /// Creates the pipe first, so a second instance fails immediately, then starts the threads.
     pub fn start(cfg: RuntimeConfig) -> io::Result<Runtime> {
-        std::fs::create_dir_all(&cfg.home)?;
+        // the home holds the database, the vault and the install secret: current user and SYSTEM only
+        velqra_ipc::make_private_dir(&cfg.home)?;
+        // The secret comes first: the host reads it the moment the pipe answers, so the pipe must not
+        // exist before the secret does. Two cores racing here agree (the secret is published atomically).
+        let secret = ensure_secret(&cfg.home)?;
         let pipe_server = PipeServer::create_first(&cfg.pipe).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::AddrInUse,
                 "another Velqra core is running, or the pipe cannot be created",
             )
         })?;
-        let secret = ensure_secret(&cfg.home)?;
         let store = SqliteStore::open(&db_path(&cfg.home))
             .map_err(|_| io::Error::other("cannot open the task store"))?;
+
+        let vault = FileVault::open(&vault_dir(&cfg.home), UserProtector::default())
+            .map_err(|_| io::Error::other("cannot open the protected vault"))?;
+
+        let loaded = Settings::load_file(&settings_path(&cfg.home));
+        let policy = loaded
+            .settings
+            .destination_policy(cfg.download_root.clone());
+        // the folder is the user's own setting (or our default), never something a page named
+        let _ = std::fs::create_dir_all(&policy.root);
+        let limits = loaded.settings.limits.clone();
+        let engine_root = policy.root.clone();
+        let aria2_exe = cfg.aria2.clone();
+        let run_dir = cfg.home.join("aria2-run");
 
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = sync_channel::<Event>(QUEUE);
@@ -96,7 +134,41 @@ impl Runtime {
                 .name("velqra-core".into())
                 .spawn(move || {
                     // built here because the core is deliberately not Send: exactly one thread ever touches it
-                    let backend = CoreBackend::new(Core::new(store), LoopbackEngine, "loopback");
+                    let backend = {
+                        let (engine, name): (Box<dyn Engine>, &str) = match aria2_exe {
+                            Some(exe) => {
+                                let launch = Launch {
+                                    exe,
+                                    expected_sha256: PINNED_ARIA2_SHA256.to_string(),
+                                    run_dir,
+                                    max_concurrent: limits.max_active,
+                                    parent_pid: std::process::id(),
+                                    ready_timeout: Duration::from_secs(5),
+                                };
+                                let cfg = Aria2Config {
+                                    split: limits.per_origin,
+                                    per_origin: limits.per_origin,
+                                };
+                                (
+                                    Box::new(Guarded::new(
+                                        Aria2Supervisor::new(launch, cfg),
+                                        engine_root,
+                                    )),
+                                    "aria2",
+                                )
+                            }
+                            None => (Box::new(LoopbackEngine), "loopback"),
+                        };
+                        CoreBackend::new(
+                            Core::with_vault(store, Box::new(vault))
+                                .with_limits(limits.max_active, limits.per_origin)
+                                .with_poll_interval(1)
+                                .with_settings(loaded)
+                                .with_destination(policy),
+                            engine,
+                            name,
+                        )
+                    };
                     let rng = StdRng::from_rng(OsRng).expect("the OS random source is available");
                     let server = BridgeServer::new(backend, secret, allowed, Box::new(rng));
                     core_loop(server, rx, stop, tick_ms);
@@ -226,7 +298,7 @@ fn connection_loop(
 }
 
 fn core_loop(
-    mut server: BridgeServer<CoreBackend<SqliteStore, LoopbackEngine>>,
+    mut server: BridgeServer<CoreBackend<SqliteStore, Box<dyn Engine>>>,
     rx: Receiver<Event>,
     stop: Arc<AtomicBool>,
     tick_ms: u64,

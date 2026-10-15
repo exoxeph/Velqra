@@ -113,7 +113,7 @@ fn pump_submits_committed_task_once_with_its_stored_request_and_finishes_it() {
 }
 
 #[test]
-fn lost_engine_reply_is_retried_with_the_same_attempt_id() {
+fn lost_engine_reply_is_resolved_by_asking_the_engine_not_by_submitting_again() {
     let mut c = Core::new(MemStore::default());
     let mut e = TestEngine {
         lose_next_reply: true,
@@ -123,8 +123,10 @@ fn lost_engine_reply_is_retried_with_the_same_attempt_id() {
     c.pump(&mut e).unwrap();
     assert_eq!(state(&c), TaskState::Committed);
     c.pump(&mut e).unwrap();
-    assert_eq!(e.submitted.len(), 1);
-    assert_eq!(state(&c), TaskState::Transferring);
+    // B1: the core asked `status`, found the task the lost reply had hidden (this engine reports it
+    // finished), and never submitted a second time
+    assert_eq!((e.submitted.len(), e.calls), (1, 1));
+    assert_eq!(state(&c), TaskState::Done);
 }
 
 #[test]
@@ -203,6 +205,9 @@ impl Store for FlakyStore {
     }
     fn remove(&mut self, t: u64) -> Result<(), velqra_core::store::StoreError> {
         self.inner.remove(t)
+    }
+    fn is_reserved(&self, key: &str) -> Result<bool, velqra_core::store::StoreError> {
+        self.inner.is_reserved(key)
     }
 }
 

@@ -391,7 +391,8 @@ impl<B: Backend> BridgeServer<B> {
             | Message::Commit(_)
             | Message::Abort(_)
             | Message::Reconcile(_)
-            | Message::Status(_) => {
+            | Message::Status(_)
+            | Message::SettingsGet(_) => {
                 if c.queue.len() >= MAX_INFLIGHT {
                     return vec![send_env(
                         conn,

@@ -33,6 +33,8 @@ fn cfg(home: &Path, pipe: &str) -> RuntimeConfig {
         home: home.to_path_buf(),
         pipe: pipe.to_string(),
         allowed: vec![ORIGIN.to_string()],
+        download_root: home.join("downloads"),
+        aria2: None,
         tick_ms: 5,
     }
 }

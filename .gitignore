@@ -37,3 +37,6 @@ build/
 .vscode/
 .idea/
 Thumbs.db
+
+# Third-party binaries fetched for local testing (never committed)
+/vendor/

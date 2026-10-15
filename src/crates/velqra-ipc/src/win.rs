@@ -437,3 +437,70 @@ pub fn spawn_detached(exe: &std::path::Path) -> io::Result<()> {
     }
     Ok(())
 }
+
+/// Creates `path` (and parents) if needed and gives it a protected access list: the current user and
+/// SYSTEM only, nothing inherited, and every file made inside inherits that list. A folder that holds
+/// a short-lived secret must not take on its parent's list, which on some machines grants other
+/// accounts read access.
+pub fn make_private_dir(path: &std::path::Path) -> io::Result<()> {
+    use windows_sys::Win32::Security::Authorization::{SetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        GetSecurityDescriptorDacl, ACL, DACL_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    std::fs::create_dir_all(path)?;
+    if !path.is_dir() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a folder"));
+    }
+    let name = path
+        .to_str()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path is not text"))?;
+    let mut name_w = wide(name);
+    let sddl = wide(&format!(
+        "D:P(A;OICI;FA;;;{})(A;OICI;FA;;;SY)",
+        current_user_sid()?
+    ));
+    let mut sd = null_mut();
+    // SAFETY: `sddl` is NUL-terminated; `sd` receives a LocalAlloc'd descriptor freed below.
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut sd,
+            null_mut(),
+        )
+    } == 0
+    {
+        return Err(os_err());
+    }
+    let mut present = 0;
+    let mut defaulted = 0;
+    let mut dacl: *mut ACL = null_mut();
+    // SAFETY: `sd` is the valid descriptor made above; the out pointers are valid locals. `dacl`
+    // points inside `sd`, which stays allocated until the LocalFree below.
+    let got = unsafe { GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted) };
+    let result = if got == 0 || present == 0 || dacl.is_null() {
+        Err(os_err())
+    } else {
+        // SAFETY: `name_w` is a NUL-terminated mutable UTF-16 path; `dacl` is valid (see above).
+        let rc = unsafe {
+            SetNamedSecurityInfoW(
+                name_w.as_mut_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                dacl,
+                null(),
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(rc as i32))
+        }
+    };
+    // SAFETY: `sd` was allocated by the conversion call above and is freed once.
+    unsafe { LocalFree(sd) };
+    result
+}

@@ -348,13 +348,11 @@ fn records_keep_the_request_but_never_the_secret_context() {
     assert!(!text.contains("S3CR3T-SENTINEL"));
     let req = rec.request.expect("request metadata is stored");
     assert_eq!(
-        (
-            req.url.as_str(),
-            req.filename.as_str(),
-            req.download_key.as_str()
-        ),
-        (URL, "a.zip", "d1")
+        (req.filename.as_str(), req.download_key.as_str()),
+        ("a.zip", "d1")
     );
+    assert!(!text.contains(URL), "the url is held by reference only");
+    assert_eq!(c.vault.get(&req.url_ref).unwrap().0, URL);
     let cref = rec.context_ref.expect("context is stored by reference");
     assert_eq!(c.vault.get(&cref).unwrap().0, "S3CR3T-SENTINEL");
 }

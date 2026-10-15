@@ -2,6 +2,8 @@
 #![forbid(unsafe_code)]
 //! Velqra ownership protocol: envelope, message bodies, limits and fingerprint.
 
+pub mod download_url;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -27,6 +29,28 @@ pub struct PrepareBody {
     pub url: String,
     pub filename: String,
     pub context: Secret,
+}
+
+/// Whether the extension should hand downloads to Velqra: everywhere, only on allowed sites, or never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureMode {
+    On,
+    PerSite,
+    Off,
+}
+
+/// A read-only copy of the core's capture settings. The extension reads it and never writes it, and
+/// it carries no folders: where files go is the core's own business.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettingsSnapshot {
+    pub mode: CaptureMode,
+    /// Lower-case suffixes without the dot that are handed over.
+    pub extensions: Vec<String>,
+    pub excluded_sites: Vec<String>,
+    pub allowed_sites: Vec<String>,
+    /// A fixed phrase when the settings file was refused and the defaults are in use.
+    pub problem: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,6 +152,8 @@ pub enum ErrorKind {
     NotArmed,
     Aborted,
     Storage,
+    /// The core has no valid place to write this download; the browser keeps it.
+    NoDestination,
     IdentityMismatch,
     Overloaded,
     Unauthenticated,
@@ -177,6 +203,8 @@ pub enum Message {
     StatusReply(Receipt),
     Health(Empty),
     HealthReply(HealthInfo),
+    SettingsGet(Empty),
+    SettingsReply(SettingsSnapshot),
     Error(ProtoError),
 }
 
@@ -197,6 +225,8 @@ impl Message {
             Message::StatusReply(_) => "status_reply",
             Message::Health(_) => "health",
             Message::HealthReply(_) => "health_reply",
+            Message::SettingsGet(_) => "settings_get",
+            Message::SettingsReply(_) => "settings_reply",
             Message::Error(_) => "error",
         }
     }
@@ -276,30 +306,16 @@ impl std::fmt::Debug for PrepareBody {
 }
 
 fn url_policy(url: &str) -> Result<(), ProtoError> {
-    let Some((scheme, authority)) = authority_of(url) else {
-        return Err(ProtoError::new(ErrorKind::Malformed, "url is not absolute"));
-    };
-    if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")) {
-        return Err(ProtoError::new(
-            ErrorKind::Malformed,
-            "only http and https urls are accepted",
-        ));
-    }
-    if authority.contains('@') {
-        return Err(ProtoError::new(
+    use download_url::{parse_download_url, UrlError};
+    match parse_download_url(url) {
+        Ok(_) => Ok(()),
+        Err(UrlError::Userinfo) => Err(ProtoError::new(
             ErrorKind::UrlUserinfo,
             "credentials in url",
-        ));
+        )),
+        // the reason is a fixed phrase: the URL itself is never echoed
+        Err(UrlError::Invalid(why)) => Err(ProtoError::new(ErrorKind::Malformed, why)),
     }
-    let host = if authority.starts_with('[') {
-        authority
-    } else {
-        authority.split(':').next().unwrap_or("")
-    };
-    if host.is_empty() {
-        return Err(ProtoError::new(ErrorKind::Malformed, "url has no host"));
-    }
-    Ok(())
 }
 
 fn filename_policy(f: &str) -> Result<(), ProtoError> {
@@ -854,6 +870,49 @@ mod tests {
             .kind(),
             "health_reply"
         );
+    }
+
+    #[test]
+    fn settings_messages_round_trip_and_have_kinds() {
+        let snap = SettingsSnapshot {
+            mode: CaptureMode::PerSite,
+            extensions: vec!["zip".into(), "iso".into()],
+            excluded_sites: vec!["a.example".into()],
+            allowed_sites: vec!["*.b.example".into()],
+            problem: Some("settings file refused".into()),
+        };
+        for body in [
+            Message::SettingsGet(Empty {}),
+            Message::SettingsReply(snap.clone()),
+        ] {
+            let env = Envelope {
+                version: PROTOCOL_VERSION,
+                message_id: "m".into(),
+                session_id: "s".into(),
+                request_id: "r".into(),
+                generation: 1,
+                body: body.clone(),
+            };
+            let wire = String::from_utf8(env.encode().unwrap()).unwrap();
+            assert!(wire.contains("settings_"), "{wire}");
+            assert_eq!(Envelope::decode(wire.as_bytes()).unwrap().body, body);
+        }
+        assert_eq!(Message::SettingsGet(Empty {}).kind(), "settings_get");
+        assert_eq!(Message::SettingsReply(snap).kind(), "settings_reply");
+        let on = serde_json::to_string(&CaptureMode::PerSite).unwrap();
+        assert_eq!(on, "\"per_site\"");
+    }
+
+    #[test]
+    fn a_snapshot_with_an_unknown_mode_or_extra_field_is_refused() {
+        let good = r#"{"version":1,"message_id":"m","session_id":"s","request_id":"r","generation":1,"body":{"type":"settings_reply","payload":{"mode":"on","extensions":[],"excluded_sites":[],"allowed_sites":[],"problem":null}}}"#;
+        assert!(Envelope::decode(good.as_bytes()).is_ok());
+        for bad in [
+            good.replace("\"on\"", "\"maybe\""),
+            good.replace("\"problem\":null", "\"problem\":null,\"root\":\"C:\\x\""),
+        ] {
+            assert!(Envelope::decode(bad.as_bytes()).is_err(), "{bad}");
+        }
     }
 
     #[test]

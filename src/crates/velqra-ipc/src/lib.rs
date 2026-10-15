@@ -4,15 +4,22 @@
 
 use std::io;
 
+mod protect;
+pub use protect::DpapiProtector;
+
 #[cfg(windows)]
 mod win;
 #[cfg(windows)]
-pub use win::{connect, current_user_sid, spawn_detached, Connection, PipeServer};
+pub use win::{
+    connect, current_user_sid, make_private_dir, spawn_detached, Connection, PipeServer,
+};
 
 #[cfg(not(windows))]
 mod stub;
 #[cfg(not(windows))]
-pub use stub::{connect, current_user_sid, spawn_detached, Connection, PipeServer};
+pub use stub::{
+    connect, current_user_sid, make_private_dir, spawn_detached, Connection, PipeServer,
+};
 
 /// `\.\pipe\velqra-core-v1-<suffix>`. The suffix is the per-user part and must be a plain token:
 /// anything else could point the client at a different pipe.

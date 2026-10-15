@@ -28,17 +28,37 @@ impl From<serde_json::Error> for StoreError {
     }
 }
 
-/// What the engine needs to reconstruct a download after a restart (no secrets here).
+/// What the engine needs to reconstruct a download after a restart. The URL can carry signed
+/// tokens, so it is held in the secret vault and only its reference is stored here. A record from
+/// before this change has no reference (empty) and is failed visibly at dispatch.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredRequest {
     pub download_key: String,
-    pub url: String,
     pub filename: String,
+    #[serde(default)]
+    pub url_ref: String,
 }
 
 impl std::fmt::Debug for StoredRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("StoredRequest { <redacted> }")
+    }
+}
+
+/// The file a task will write, chosen and held at Prepare so two tasks can never collide on a name.
+/// `key` is the case- and normalisation-folded form that the uniqueness index compares.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reservation {
+    pub path: String,
+    pub key: String,
+    /// An aborted task gives its name back; nothing on disk is touched.
+    pub released: bool,
+}
+
+impl Reservation {
+    /// The key the uniqueness index sees: none once released.
+    pub fn active_key(&self) -> Option<&str> {
+        (!self.released).then_some(self.key.as_str())
     }
 }
 
@@ -64,6 +84,40 @@ pub struct Record {
     /// A tombstone whose payload was dropped after retention; it still fences the request id.
     #[serde(default)]
     pub compacted: bool,
+    /// The reserved destination file, when the core was given a destination policy.
+    #[serde(default)]
+    pub destination: Option<Reservation>,
+    /// The engine's answer to the last submit was lost: the task may or may not exist there.
+    #[serde(default)]
+    pub engine_ambiguous: bool,
+    /// Questions about that task the engine could not answer.
+    #[serde(default)]
+    pub engine_queries: u32,
+    /// Times the core submitted again after proving the engine did not know the task.
+    #[serde(default)]
+    pub engine_resubmits: u32,
+    /// Identity could not be proven; the core stops touching the task and says why.
+    #[serde(default)]
+    pub held: bool,
+    /// Times the engine forgot a running task and it was submitted again.
+    #[serde(default)]
+    pub engine_redispatches: u32,
+    /// Higher starts first; ties go to the older task.
+    #[serde(default)]
+    pub priority: i32,
+    /// Why a committed task is not running yet (a fixed phrase), shown to the user.
+    #[serde(default)]
+    pub queued_reason: Option<String>,
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default)]
+    pub pause_reason: Option<String>,
+    /// Attempts started again after a transient failure.
+    #[serde(default)]
+    pub retries: u32,
+    /// Seconds (the core's clock) before which a retry must not start; 0 when none is waiting.
+    #[serde(default)]
+    pub retry_at: u64,
 }
 
 impl Record {
@@ -87,6 +141,18 @@ impl Record {
             context_ref: None,
             fail_reason: None,
             compacted: false,
+            destination: None,
+            engine_ambiguous: false,
+            engine_queries: 0,
+            engine_resubmits: 0,
+            held: false,
+            engine_redispatches: 0,
+            priority: 0,
+            queued_reason: None,
+            paused: false,
+            pause_reason: None,
+            retries: 0,
+            retry_at: 0,
         }
     }
 }
@@ -103,6 +169,8 @@ pub trait Store {
     fn next_task_id(&self) -> Result<u64, StoreError>;
     fn all(&self) -> Result<Vec<Record>, StoreError>;
     fn remove(&mut self, task_id: u64) -> Result<(), StoreError>;
+    /// True when an unreleased reservation holds this folded key.
+    fn is_reserved(&self, key: &str) -> Result<bool, StoreError>;
 }
 
 #[derive(Default, Clone)]
@@ -111,6 +179,18 @@ pub struct MemStore {
     next: u64,
     /// Number of upcoming `put` calls that fail without writing.
     pub fail_puts: usize,
+}
+
+impl MemStore {
+    fn key_taken_by_other(&self, record: &Record) -> bool {
+        let Some(key) = record.destination.as_ref().and_then(|d| d.active_key()) else {
+            return false;
+        };
+        self.map.values().any(|r| {
+            r.task_id != record.task_id
+                && r.destination.as_ref().and_then(|d| d.active_key()) == Some(key)
+        })
+    }
 }
 
 impl Store for MemStore {
@@ -128,6 +208,9 @@ impl Store for MemStore {
         if self.fail_puts > 0 {
             self.fail_puts -= 1;
             return Err(StoreError::Io("injected put failure".into()));
+        }
+        if self.key_taken_by_other(record) {
+            return Err(StoreError::Conflict);
         }
         self.next = self.next.max(record.task_id + 1);
         self.map.insert(record.task_id, record.clone());
@@ -151,6 +234,12 @@ impl Store for MemStore {
         self.map.remove(&task_id);
         Ok(())
     }
+    fn is_reserved(&self, key: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .map
+            .values()
+            .any(|r| r.destination.as_ref().and_then(|d| d.active_key()) == Some(key)))
+    }
 }
 
 pub struct SqliteStore {
@@ -167,11 +256,23 @@ impl SqliteStore {
             "CREATE TABLE IF NOT EXISTS records(
                 task_id INTEGER PRIMARY KEY,
                 request_id TEXT NOT NULL UNIQUE,
-                json TEXT NOT NULL);
+                json TEXT NOT NULL,
+                dest_key TEXT);
              CREATE TABLE IF NOT EXISTS meta(
                 id INTEGER PRIMARY KEY CHECK(id = 1),
                 next INTEGER NOT NULL);
              INSERT OR IGNORE INTO meta(id, next) VALUES(1, 1);",
+        )?;
+        // databases created before reservations existed get the column in place; NULL keys never collide
+        let has_column = conn
+            .prepare("SELECT 1 FROM pragma_table_info('records') WHERE name = 'dest_key'")?
+            .exists([])?;
+        if !has_column {
+            conn.execute("ALTER TABLE records ADD COLUMN dest_key TEXT", [])?;
+        }
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS records_dest_key ON records(dest_key)",
+            [],
         )?;
         Ok(Self { conn })
     }
@@ -206,11 +307,27 @@ impl Store for SqliteStore {
     }
     fn put(&mut self, record: &Record) -> Result<(), StoreError> {
         let json = serde_json::to_string(record)?;
+        let dest_key = record
+            .destination
+            .as_ref()
+            .and_then(|d| d.active_key().map(str::to_string));
         let tx = self.conn.transaction()?;
-        tx.execute(
-            "INSERT OR REPLACE INTO records(task_id, request_id, json) VALUES(?1, ?2, ?3)",
-            params![record.task_id as i64, record.request_id, json],
-        )?;
+        // an upsert on the task id only: REPLACE would silently delete another row that holds the
+        // same reservation or request id, so those collisions are errors instead
+        match tx.execute(
+            "INSERT INTO records(task_id, request_id, json, dest_key) VALUES(?1, ?2, ?3, ?4)
+             ON CONFLICT(task_id) DO UPDATE SET
+                request_id = excluded.request_id, json = excluded.json, dest_key = excluded.dest_key",
+            params![record.task_id as i64, record.request_id, json, dest_key],
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                return Err(StoreError::Conflict)
+            }
+            Err(e) => return Err(e.into()),
+        }
         tx.execute(
             "UPDATE meta SET next = MAX(next, ?1) WHERE id = 1",
             params![record.task_id as i64 + 1],
@@ -220,10 +337,14 @@ impl Store for SqliteStore {
     }
     fn insert(&mut self, record: &Record) -> Result<(), StoreError> {
         let json = serde_json::to_string(record)?;
+        let dest_key = record
+            .destination
+            .as_ref()
+            .and_then(|d| d.active_key().map(str::to_string));
         let tx = self.conn.transaction()?;
         match tx.execute(
-            "INSERT INTO records(task_id, request_id, json) VALUES(?1, ?2, ?3)",
-            params![record.task_id as i64, record.request_id, json],
+            "INSERT INTO records(task_id, request_id, json, dest_key) VALUES(?1, ?2, ?3, ?4)",
+            params![record.task_id as i64, record.request_id, json, dest_key],
         ) {
             Ok(_) => {}
             Err(rusqlite::Error::SqliteFailure(e, _))
@@ -261,5 +382,11 @@ impl Store for SqliteStore {
         self.conn
             .execute("DELETE FROM records WHERE task_id = ?1", [task_id as i64])?;
         Ok(())
+    }
+    fn is_reserved(&self, key: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .conn
+            .prepare("SELECT 1 FROM records WHERE dest_key = ?1")?
+            .exists([key])?)
     }
 }

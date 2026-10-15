@@ -171,6 +171,9 @@ impl<S: Store> Store for FaultyStore<S> {
     fn remove(&mut self, t: u64) -> Result<(), StoreError> {
         self.inner.remove(t)
     }
+    fn is_reserved(&self, key: &str) -> Result<bool, StoreError> {
+        self.inner.is_reserved(key)
+    }
 }
 
 #[cfg(test)]

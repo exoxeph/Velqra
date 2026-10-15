@@ -10,7 +10,11 @@ velqra-core.workspace = true
 velqra-bridge.workspace = true
 velqra-ipc.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 rand.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading"] }

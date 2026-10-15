@@ -82,6 +82,9 @@ impl Store for StaleIdStore {
     fn remove(&mut self, t: u64) -> Result<(), StoreError> {
         self.inner.remove(t)
     }
+    fn is_reserved(&self, key: &str) -> Result<bool, StoreError> {
+        self.inner.is_reserved(key)
+    }
 }
 
 #[test]
@@ -136,8 +139,8 @@ fn a_failed_allocation_leaves_no_orphaned_context() {
     c.handle(&env("rb", 2, Message::Prepare(body("b"))), 2);
     assert_eq!(
         vault.len(),
-        2,
-        "one context per accepted task, none leaked by the collision"
+        4,
+        "context and url per accepted task, none leaked by the collision"
     );
 }
 

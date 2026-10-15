@@ -42,7 +42,11 @@ impl<S: Store, E: Engine> Backend for CoreBackend<S, E> {
     }
 
     fn pump(&mut self) {
-        let _ = self.core.pump(&mut self.engine);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = self.core.pump_at(&mut self.engine, now);
         // the observation buffer is bounded here: durable ownership never depends on it
         self.core.dispatch_log.clear();
     }

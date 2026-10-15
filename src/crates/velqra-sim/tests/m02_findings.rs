@@ -47,6 +47,8 @@ fn an_early_engine_call_hidden_by_a_later_valid_dispatch_is_caught() {
         url: "https://x.test/a.zip".into(),
         filename: "a.zip".into(),
         context_ref: None,
+        destination: None,
+        context: None,
     };
     let _ = w.engine.submit(&early);
     let r = w.run();

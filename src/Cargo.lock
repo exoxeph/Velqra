@@ -636,6 +636,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinyvec"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
+
+[[package]]
 name = "toml_datetime"
 version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -684,6 +690,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 
 [[package]]
+name = "unicode-normalization"
+version = "0.1.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
+dependencies = [
+ "tinyvec",
+]
+
+[[package]]
 name = "vcpkg"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -695,11 +710,13 @@ version = "0.0.1"
 dependencies = [
  "rand 0.8.8",
  "serde_json",
+ "sha2",
  "tempfile",
  "velqra-bridge",
  "velqra-core",
  "velqra-ipc",
  "velqra-protocol",
+ "windows-sys",
 ]
 
 [[package]]
@@ -721,11 +738,13 @@ dependencies = [
 name = "velqra-core"
 version = "0.0.1"
 dependencies = [
+ "proptest",
  "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
+ "unicode-normalization",
  "velqra-protocol",
 ]
 
@@ -733,6 +752,7 @@ dependencies = [
 name = "velqra-ipc"
 version = "0.0.1"
 dependencies = [
+ "tempfile",
  "windows-sys",
 ]
 

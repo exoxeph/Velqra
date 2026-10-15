@@ -43,3 +43,8 @@ pub fn current_user_sid() -> io::Result<String> {
 pub fn spawn_detached(_exe: &std::path::Path) -> io::Result<()> {
     unsupported()
 }
+
+/// Without Windows access lists the best available is a plain folder.
+pub fn make_private_dir(path: &std::path::Path) -> io::Result<()> {
+    std::fs::create_dir_all(path)
+}

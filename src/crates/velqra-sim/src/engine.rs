@@ -61,6 +61,8 @@ mod tests {
             url: "https://x.test/a".into(),
             filename: "a.zip".into(),
             context_ref: None,
+            destination: None,
+            context: None,
         }
     }
 
