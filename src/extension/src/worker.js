@@ -1,16 +1,27 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // @ts-check
 // MV3 service worker. Listeners are registered synchronously, as the platform requires, and the
-// worker only ever uses the `runtime`, `storage` and `alarms` APIs (see test/manifest.test.mjs).
+// capture.js registers browser listeners before any asynchronous initialization.
 import { BridgeClient } from './bridge.js';
+import { installCapture } from './capture.js';
+import { watchPort } from './port_lifecycle.js';
 
 const origin = `chrome-extension://${chrome.runtime.id}/`;
 
+let capture;
+let currentPort;
 export const client = new BridgeClient({
   connectNative: (host) => {
     const port = chrome.runtime.connectNative(host);
+    currentPort = port;
     // reading lastError marks it as handled, so Chrome does not log it as unchecked
     port.onDisconnect.addListener(() => void chrome.runtime.lastError);
+    watchPort(port, {
+      isCurrent: () => currentPort === port,
+      connect: () => client.connect(),
+      onReady: () => { void capture.refresh(); },
+      onDrop: () => capture?.disconnected(),
+    });
     return port;
   },
   origin,
@@ -19,9 +30,10 @@ export const client = new BridgeClient({
     set: (key, value) => chrome.storage.local.set({ [key]: value }),
   },
 });
+capture = installCapture({ chrome, bridge: client });
 
 const reach = () => {
-  if (client.state !== 'ready') client.connect().catch(() => {});
+  client.connect().then(() => capture.refresh()).catch(() => { if (client.state !== 'ready') capture.disconnected(); });
 };
 
 chrome.runtime.onStartup.addListener(reach);

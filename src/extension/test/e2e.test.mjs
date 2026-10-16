@@ -4,11 +4,12 @@
 // Needs the binaries (`cargo build -p velqra-app` from src/); it is skipped, loudly, when they are absent.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { cleanupOwned, stopChild, reportCleanup, stopPid } from './process_cleanup.mjs';
 import { BridgeClient, BridgeError } from '../src/bridge.js';
 
 const BIN = fileURLToPath(new URL('../../target/debug/', import.meta.url));
@@ -20,18 +21,20 @@ const have = existsSync(HOST) && existsSync(APP);
 if (!have) console.warn(`SKIPPED: build the binaries first (${HOST})`);
 
 let counter = 0;
+const children = new Map();
 
 function environment() {
   const home = mkdtempSync(join(tmpdir(), 'velqra-js-e2e-'));
   const suffix = `js-e2e-${process.pid}-${++counter}`;
-  const env = { ...process.env, VELQRA_HOME: home, VELQRA_PIPE: suffix, VELQRA_APP: APP };
-  delete env.VELQRA_ALLOWED_ORIGINS;
+  const env = { ...process.env, VELQRA_HOME: home, VELQRA_PIPE: suffix, VELQRA_APP: APP, VELQRA_ALLOW_LOOPBACK: '1' };
+  delete env.VELQRA_ALLOWED_ORIGINS; delete env.VELQRA_ARIA2;
   return { home, env };
 }
 
 /** A chrome.runtime.Port look-alike over a child process speaking native-messaging frames. */
 function hostPort(/** @type {NodeJS.ProcessEnv} */ env) {
   const child = spawn(HOST, [ORIGIN, '--parent-window=0'], { env, stdio: ['pipe', 'pipe', 'ignore'] });
+  const list = children.get(env.VELQRA_HOME) ?? []; list.push(child); children.set(env.VELQRA_HOME, list);
   /** @type {((m: any) => void)[]} */ const onMessage = [];
   /** @type {(() => void)[]} */ const onDisconnect = [];
   let buf = Buffer.alloc(0);
@@ -82,9 +85,9 @@ function memoryStorage(/** @type {Record<string,string>} */ data = {}) {
 function killCore(/** @type {string} */ home) {
   try {
     const pid = readFileSync(join(home, 'velqra-app.pid'), 'utf8').trim();
-    spawnSync('taskkill', ['/F', '/PID', pid], { stdio: 'ignore' });
-  } catch {
-    /* it was never started */
+    stopPid(pid);
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
   }
 }
 
@@ -125,8 +128,10 @@ test('pairing, handshake and a full hand-off against the real host and core', { 
     assert.ok(['committed', 'transferring', 'done'].includes(committed.body.payload.state), committed.body.payload.state);
   } finally {
     client.close();
-    killCore(home);
-    rmSync(home, { recursive: true, force: true });
+    reportCleanup(await cleanupOwned({
+      stop: async () => { for (const child of children.get(home) ?? []) await stopChild(child); killCore(home); children.delete(home); },
+      remove: () => rmSync(home, { recursive: true, force: true }),
+    }));
   }
 });
 
@@ -140,8 +145,10 @@ test('a client holding the wrong secret refuses the real core and is never authe
     await assert.rejects(client.request({ type: 'health', payload: {} }, { requestId: 'r' }), (e) => e instanceof BridgeError && e.code === 'kept_in_browser');
   } finally {
     client.close();
-    killCore(home);
-    rmSync(home, { recursive: true, force: true });
+    reportCleanup(await cleanupOwned({
+      stop: async () => { for (const child of children.get(home) ?? []) await stopChild(child); killCore(home); children.delete(home); },
+      remove: () => rmSync(home, { recursive: true, force: true }),
+    }));
   }
 });
 
@@ -164,7 +171,9 @@ test('when the core dies the client falls back, then reconnects on its own and f
     assert.equal(status.body.payload.state, 'prepared');
   } finally {
     client.close();
-    killCore(home);
-    rmSync(home, { recursive: true, force: true });
+    reportCleanup(await cleanupOwned({
+      stop: async () => { for (const child of children.get(home) ?? []) await stopChild(child); killCore(home); children.delete(home); },
+      remove: () => rmSync(home, { recursive: true, force: true }),
+    }));
   }
 });

@@ -12,6 +12,13 @@
   "permissions": [
     "nativeMessaging",
     "storage",
-    "alarms"
-  ]
+    "alarms",
+    "downloads",
+    "webRequest",
+    "contextMenus"
+  ],
+  "host_permissions": ["http://*/*", "https://*/*"],
+  "optional_permissions": ["management"],
+  "action": { "default_title": "Keep the next download in Chrome" },
+  "options_page": "options.html"
 }

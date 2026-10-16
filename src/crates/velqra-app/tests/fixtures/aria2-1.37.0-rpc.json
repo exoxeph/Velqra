@@ -1,0 +1,60 @@
+{
+  "version": {
+    "id": "measure",
+    "jsonrpc": "2.0",
+    "result": {
+      "enabledFeatures": [
+        "Async DNS",
+        "BitTorrent",
+        "Firefox3 Cookie",
+        "GZip",
+        "HTTPS",
+        "Message Digest",
+        "Metalink",
+        "XML-RPC",
+        "SFTP"
+      ],
+      "version": "1.37.0"
+    }
+  },
+  "aria2.tellStatus": {
+    "id": "measure",
+    "jsonrpc": "2.0",
+    "error": {
+      "code": 1,
+      "message": "GID 0123456789abcdef is not found"
+    }
+  },
+  "aria2.pause": {
+    "id": "measure",
+    "jsonrpc": "2.0",
+    "error": {
+      "code": 1,
+      "message": "GID 0123456789abcdef is not found"
+    }
+  },
+  "aria2.unpause": {
+    "id": "measure",
+    "jsonrpc": "2.0",
+    "error": {
+      "code": 1,
+      "message": "GID 0123456789abcdef is not found"
+    }
+  },
+  "aria2.forceRemove": {
+    "id": "measure",
+    "jsonrpc": "2.0",
+    "error": {
+      "code": 1,
+      "message": "GID 0123456789abcdef is not found"
+    }
+  },
+  "aria2.removeDownloadResult": {
+    "id": "measure",
+    "jsonrpc": "2.0",
+    "error": {
+      "code": 1,
+      "message": "GID 0123456789abcdef is not found"
+    }
+  }
+}

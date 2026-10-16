@@ -348,3 +348,34 @@ fn the_engine_request_carries_the_reserved_path_and_the_context_text() {
     assert_eq!(req.context.as_deref(), Some("ctx"));
     assert!(!format!("{req:?}").contains("ctx"), "Debug stays redacted");
 }
+
+#[test]
+fn prepare_reserves_every_internal_suffix_before_issuing_a_receipt() {
+    let d = tempfile::tempdir().unwrap();
+    let mut core =
+        Core::new(MemStore::default()).with_destination(DestinationPolicy::new(d.path().into()));
+    for units in 244..=255 {
+        let rid = format!("long{units}");
+        let result = prepare(&mut core, &rid, &"x".repeat(units));
+        assert!(
+            matches!(result.body, Message::Error(_)),
+            "unsafe {units}-unit name got a receipt"
+        );
+        assert!(core.store.get_by_request(&rid).unwrap().is_none());
+    }
+    for units in [225, 226] {
+        let rid = format!("safe{units}");
+        assert!(matches!(
+            prepare(&mut core, &rid, &"x".repeat(units)).body,
+            Message::Prepared(_)
+        ));
+        let path = path_of(&core, &rid);
+        let name = path.file_name().unwrap().to_string_lossy();
+        assert!(
+            format!("{name}.velqra-part.stale-9999.aria2")
+                .encode_utf16()
+                .count()
+                <= 255
+        );
+    }
+}

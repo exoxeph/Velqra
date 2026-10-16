@@ -17,6 +17,12 @@ pub trait Backend {
     fn pump(&mut self);
     /// Short engine description for health replies.
     fn engine_name(&self) -> String;
+    fn transfer_capable(&mut self) -> bool {
+        true
+    }
+    fn problem(&mut self) -> Option<String> {
+        None
+    }
 }
 
 /// The real ownership core with an engine.
@@ -34,10 +40,19 @@ impl<S: Store, E: Engine> CoreBackend<S, E> {
             name: name.to_string(),
         }
     }
+    fn refresh_capability(&mut self) {
+        if let Some(capable) = self.engine.readiness() {
+            self.core.transfer_capable = capable;
+            self.core.engine_problem = (!capable).then(|| {
+                "Pinned transfer engine unavailable; downloads stay in the browser.".into()
+            });
+        }
+    }
 }
 
 impl<S: Store, E: Engine> Backend for CoreBackend<S, E> {
     fn handle(&mut self, env: &Envelope, now: u64) -> Envelope {
+        self.refresh_capability();
         self.core.handle(env, now)
     }
 
@@ -53,6 +68,14 @@ impl<S: Store, E: Engine> Backend for CoreBackend<S, E> {
 
     fn engine_name(&self) -> String {
         self.name.clone()
+    }
+    fn transfer_capable(&mut self) -> bool {
+        self.refresh_capability();
+        self.core.transfer_capable
+    }
+    fn problem(&mut self) -> Option<String> {
+        self.refresh_capability();
+        self.core.engine_problem.clone()
     }
 }
 
@@ -89,5 +112,11 @@ impl<B: Backend> Backend for Spy<B> {
 
     fn engine_name(&self) -> String {
         self.inner.engine_name()
+    }
+    fn transfer_capable(&mut self) -> bool {
+        self.inner.transfer_capable()
+    }
+    fn problem(&mut self) -> Option<String> {
+        self.inner.problem()
     }
 }

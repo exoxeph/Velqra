@@ -44,6 +44,7 @@ pub enum CaptureMode {
 /// it carries no folders: where files go is the core's own business.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SettingsSnapshot {
+    pub transfer_capable: bool,
     pub mode: CaptureMode,
     /// Lower-case suffixes without the dot that are handed over.
     pub extensions: Vec<String>,
@@ -129,6 +130,8 @@ pub struct Empty {}
 /// Answer to a health check: which core answered and what it speaks. Nothing secret.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthInfo {
+    pub transfer_capable: bool,
+    pub problem: Option<String>,
     pub core_instance: String,
     pub versions: Vec<u16>,
     pub engine: String,
@@ -844,6 +847,8 @@ mod tests {
     #[test]
     fn health_messages_round_trip_and_have_kinds() {
         let info = HealthInfo {
+            transfer_capable: true,
+            problem: None,
             core_instance: "c1".into(),
             versions: vec![1],
             engine: "fake".into(),
@@ -863,6 +868,8 @@ mod tests {
         assert_eq!(Message::Health(Empty {}).kind(), "health");
         assert_eq!(
             Message::HealthReply(HealthInfo {
+                transfer_capable: true,
+                problem: None,
                 core_instance: String::new(),
                 versions: vec![],
                 engine: String::new()
@@ -875,6 +882,7 @@ mod tests {
     #[test]
     fn settings_messages_round_trip_and_have_kinds() {
         let snap = SettingsSnapshot {
+            transfer_capable: true,
             mode: CaptureMode::PerSite,
             extensions: vec!["zip".into(), "iso".into()],
             excluded_sites: vec!["a.example".into()],
@@ -905,7 +913,7 @@ mod tests {
 
     #[test]
     fn a_snapshot_with_an_unknown_mode_or_extra_field_is_refused() {
-        let good = r#"{"version":1,"message_id":"m","session_id":"s","request_id":"r","generation":1,"body":{"type":"settings_reply","payload":{"mode":"on","extensions":[],"excluded_sites":[],"allowed_sites":[],"problem":null}}}"#;
+        let good = r#"{"version":1,"message_id":"m","session_id":"s","request_id":"r","generation":1,"body":{"type":"settings_reply","payload":{"mode":"on","extensions":[],"excluded_sites":[],"allowed_sites":[],"transfer_capable":true,"problem":null}}}"#;
         assert!(Envelope::decode(good.as_bytes()).is_ok());
         for bad in [
             good.replace("\"on\"", "\"maybe\""),

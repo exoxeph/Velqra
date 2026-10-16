@@ -15,12 +15,15 @@ struct Fake {
     submitted: Vec<String>,
     state: HashMap<String, EngineStatus>,
     paused: Vec<String>,
+    lose_pause: bool,
     resumed: Vec<String>,
     /// The next submit takes effect but its reply is lost.
     lose_next: bool,
     /// The engine cannot be asked anything.
     down: bool,
+    forgotten: bool,
     finished_calls: usize,
+    retained: Vec<Vec<String>>,
 }
 
 impl Fake {
@@ -39,6 +42,10 @@ impl Fake {
 }
 
 impl Engine for Fake {
+    fn retain_attempts(&mut self, live: &[String]) {
+        self.retained.push(live.to_vec());
+    }
+
     fn submit(&mut self, r: &EngineRequest) -> Result<(), EngineError> {
         self.submitted.push(r.attempt.clone());
         self.state.insert(
@@ -67,8 +74,15 @@ impl Engine for Fake {
         }
         Ok(self.state.get(a).cloned().unwrap_or(EngineStatus::Unknown))
     }
+    fn has_forgotten(&mut self, a: &str) -> bool {
+        self.forgotten && !self.down && !self.state.contains_key(a)
+    }
     fn pause(&mut self, a: &str) -> Result<(), EngineError> {
         self.paused.push(a.into());
+        if self.lose_pause {
+            return Err(EngineError::ReplyLost);
+        }
+        self.state.insert(a.into(), EngineStatus::Paused);
         Ok(())
     }
     fn resume(&mut self, a: &str) -> Result<(), EngineError> {
@@ -368,16 +382,82 @@ fn a_task_whose_submit_reply_was_lost_keeps_its_slot_until_its_fate_is_known() {
     assert!(rec(&c, first).engine_ambiguous);
     // the second must not start while the first might be running
     e.down = true;
-    for t in 11..14 {
+    for t in 11..19 {
         c.pump_at(&mut e, t).unwrap();
     }
     assert!(!e.submitted.contains(&attempt(second)));
+    assert!(rec(&c, first).held);
     e.down = false;
     c.pump_at(&mut e, 20).unwrap();
     assert_eq!(state(&c, first), TaskState::Transferring);
     assert!(
         !e.submitted.contains(&attempt(second)),
         "now it is plainly running and still holds the slot"
+    );
+    e.finish(&attempt(first));
+    c.pump_at(&mut e, 21).unwrap();
+    assert!(e.submitted.contains(&attempt(second)));
+}
+
+#[test]
+fn lost_submit_then_pause_is_enforced_when_active_is_recovered() {
+    let mut c = new_core(5, 1);
+    let mut e = Fake::default();
+    let id = commit(&mut c, 1, "a.test");
+    e.lose_next = true;
+    c.pump_at(&mut e, 10).unwrap();
+    c.pause_task(&mut e, id, "paused by the user").unwrap();
+    assert!(!rec(&c, id).paused, "pending pause is not acknowledged");
+    assert!(rec(&c, id).engine_ambiguous);
+    c.pump_at(&mut e, 11).unwrap();
+    assert_eq!(e.paused, [attempt(id)]);
+    assert!(rec(&c, id).paused);
+    assert!(!rec(&c, id).engine_ambiguous);
+    assert_eq!(state(&c, id), TaskState::Transferring);
+}
+
+#[test]
+fn ambiguous_pause_keeps_intent_and_slot_until_engine_confirmation() {
+    let mut c = new_core(1, 1);
+    let mut e = Fake::default();
+    let id = commit(&mut c, 1, "a.test");
+    let second = commit(&mut c, 2, "b.test");
+    e.lose_next = true;
+    c.pump_at(&mut e, 10).unwrap();
+    c.pause_task(&mut e, id, "paused by the user").unwrap();
+    e.lose_pause = true;
+    c.pump_at(&mut e, 11).unwrap();
+    assert!(!rec(&c, id).paused);
+    assert!(rec(&c, id).engine_ambiguous);
+    assert!(rec(&c, id).pending_pause.is_some());
+    assert!(!e.submitted.contains(&attempt(second)));
+    e.lose_pause = false;
+    c.pump_at(&mut e, 12).unwrap();
+    assert!(rec(&c, id).paused);
+    assert!(rec(&c, id).pending_pause.is_none());
+    assert_eq!(e.paused, [attempt(id), attempt(id)]);
+}
+
+#[test]
+fn held_ambiguous_task_keeps_per_origin_slot_with_roomy_global_limit() {
+    let mut c = new_core(99, 1);
+    let mut e = Fake::default();
+    let first = commit(&mut c, 1, "a.test");
+    let other = commit(&mut c, 3, "b.test");
+    e.lose_next = true;
+    c.pump_at(&mut e, 10).unwrap();
+    assert_eq!(e.submitted, [attempt(first), attempt(other)]);
+    e.down = true;
+    for t in 11..19 {
+        c.pump_at(&mut e, t).unwrap();
+    }
+    assert!(rec(&c, first).held);
+    let second = commit(&mut c, 2, "a.test");
+    c.pump_at(&mut e, 19).unwrap();
+    assert!(!e.submitted.contains(&attempt(second)));
+    assert_eq!(
+        rec(&c, second).queued_reason.as_deref(),
+        Some("waiting for a free connection to this site")
     );
 }
 
@@ -490,4 +570,86 @@ proptest! {
             prop_assert_eq!(rec(&c, *id).state, TaskState::Done, "task {} starved", id);
         }
     }
+}
+
+#[test]
+fn user_pause_survives_engine_death_without_network_redispatch() {
+    let mut c = new_core(1, 1);
+    let mut e = Fake::default();
+    let id = commit(&mut c, 1, "a.test");
+    c.pump_at(&mut e, 10).unwrap();
+    c.pause_task(&mut e, id, "paused by the user").unwrap();
+    e.down = true;
+    e.forgotten = true;
+    e.state.clear();
+    c.pump_at(&mut e, 11).unwrap();
+    e.down = false;
+    c.pump_at(&mut e, 12).unwrap();
+    c.pump_at(&mut e, 13).unwrap();
+    assert_eq!(
+        e.submitted.len(),
+        1,
+        "no submit, even briefly, before user resume"
+    );
+    assert_eq!(state(&c, id), TaskState::Committed);
+    assert!(rec(&c, id).paused);
+    c.resume_task(&mut e, id).unwrap();
+    c.pump_at(&mut e, 14).unwrap();
+    assert_eq!(e.submitted.len(), 2);
+}
+
+#[test]
+fn a_held_ambiguous_task_releases_capacity_only_after_confirmed_absence() {
+    let mut c = new_core(1, 1);
+    let mut e = Fake::default();
+    let first = commit(&mut c, 1, "a.test");
+    let second = commit(&mut c, 2, "a.test");
+    e.lose_next = true;
+    c.pump_at(&mut e, 10).unwrap();
+    e.down = true;
+    for t in 11..19 {
+        c.pump_at(&mut e, t).unwrap();
+    }
+    assert!(rec(&c, first).held);
+    assert_eq!(e.submitted.len(), 1);
+    e.down = false;
+    e.state.clear();
+    c.pump_at(&mut e, 20).unwrap();
+    assert!(rec(&c, first).held);
+    assert!(!rec(&c, first).engine_ambiguous);
+    assert_eq!(e.submitted, [attempt(first), attempt(second)]);
+}
+
+#[test]
+fn adapter_retirement_follows_terminal_persistence_and_keeps_ambiguous_attempts() {
+    let mut c = new_core(2, 2);
+    let mut e = Fake::default();
+    let id = commit(&mut c, 1, "a.test");
+    c.pump_at(&mut e, 10).unwrap();
+    assert_eq!(e.retained.last().unwrap(), &vec![attempt(id)]);
+    e.finish(&attempt(id));
+    c.store.fail_puts = 1;
+    let acks = e.retained.len();
+    assert!(c.pump_at(&mut e, 11).is_err());
+    assert_eq!(
+        e.retained.len(),
+        acks,
+        "failed persistence cannot release pins"
+    );
+    c.pump_at(&mut e, 12).unwrap();
+    assert_eq!(state(&c, id), TaskState::Done);
+    assert!(e.retained.last().unwrap().is_empty());
+    let submitted = e.submitted.len();
+    for t in 13..20 {
+        c.pump_at(&mut e, t).unwrap();
+    }
+    assert_eq!(
+        e.submitted.len(),
+        submitted,
+        "durable terminal fence excludes redispatch"
+    );
+    let id = commit(&mut c, 2, "a.test");
+    e.lose_next = true;
+    c.pump_at(&mut e, 20).unwrap();
+    assert_eq!(e.retained.last().unwrap(), &vec![attempt(id)]);
 }

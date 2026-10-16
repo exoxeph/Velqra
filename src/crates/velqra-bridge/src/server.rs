@@ -380,6 +380,8 @@ impl<B: Backend> BridgeServer<B> {
             Message::Health(_) => {
                 self.stats.answered_locally += 1;
                 let info = HealthInfo {
+                    transfer_capable: self.backend.transfer_capable(),
+                    problem: self.backend.problem(),
                     core_instance: b64_encode(&self.core_id),
                     versions: vec![1],
                     engine: self.backend.engine_name(),

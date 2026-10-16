@@ -24,6 +24,8 @@ pub struct Core<S: Store> {
     /// What the extension may read; nothing in a message can change it.
     settings: Settings,
     settings_problem: Option<String>,
+    pub transfer_capable: bool,
+    pub engine_problem: Option<String>,
     /// Queue limits; unlimited unless the application sets them from its settings.
     max_active: u32,
     per_origin: u32,
@@ -95,6 +97,8 @@ impl<S: Store> Core<S> {
             destination: None,
             settings: Settings::default(),
             settings_problem: None,
+            transfer_capable: true,
+            engine_problem: None,
             max_active: u32::MAX,
             per_origin: u32::MAX,
             poll_interval: 0,
@@ -121,6 +125,13 @@ impl<S: Store> Core<S> {
         self
     }
 
+    pub fn with_transfer_capability(mut self, capable: bool) -> Self {
+        self.transfer_capable = capable;
+        self.engine_problem = (!capable)
+            .then(|| "Pinned transfer engine unavailable; downloads stay in the browser.".into());
+        self
+    }
+
     pub fn with_destination(mut self, policy: DestinationPolicy) -> Self {
         self.destination = Some(policy);
         self
@@ -131,6 +142,9 @@ impl<S: Store> Core<S> {
             return reply(env, Message::Error(e));
         }
         match &env.body {
+            Message::Prepare(_) | Message::BeginHandoff(_) if !self.transfer_capable => {
+                error(env, ErrorKind::WrongState, "transfer engine unavailable")
+            }
             Message::Prepare(p) => self.prepare(env, p),
             Message::BeginHandoff(r) => self.apply(env, now, Some(r), Message::Armed, |rec, _| {
                 match rec.state {
@@ -165,12 +179,24 @@ impl<S: Store> Core<S> {
             Message::Abort(a) => self.abort(env, now, a.receipt.as_ref()),
             Message::Reconcile(b) => self.reconcile(env, now, b),
             Message::Status(_) => {
-                self.apply(env, now, None, Message::StatusReply, |_, _| Ok(false))
+                let capable = self.transfer_capable;
+                self.apply(env, now, None, Message::StatusReply, |rec, _| {
+                    if !capable && matches!(rec.state, TaskState::Prepared | TaskState::Armed) {
+                        Err(ErrorKind::WrongState)
+                    } else {
+                        Ok(false)
+                    }
+                })
             }
-            Message::SettingsGet(_) => reply(
-                env,
-                Message::SettingsReply(self.settings.snapshot(self.settings_problem.as_deref())),
-            ),
+            Message::SettingsGet(_) => {
+                let mut snapshot = self.settings.snapshot(
+                    self.engine_problem
+                        .as_deref()
+                        .or(self.settings_problem.as_deref()),
+                );
+                snapshot.transfer_capable = self.transfer_capable;
+                reply(env, Message::SettingsReply(snapshot))
+            }
             _ => error(env, ErrorKind::WrongState, "not a request"),
         }
     }
@@ -516,6 +542,16 @@ impl std::fmt::Debug for EngineRequest {
 
 /// Transfer engine boundary. `submit` must be idempotent by `attempt` id.
 pub trait Engine {
+    /// Current admission readiness; None leaves a caller-supplied capability unchanged.
+    fn readiness(&mut self) -> Option<bool> {
+        None
+    }
+
+    /// Called only after successful durable queue writes. IDs omitted here can no longer be queried
+    /// or submitted by this Core: terminal identity/fences remain in Store, not in adapter caches.
+    /// A retry's new ID supersedes its definitively stopped old attempt.
+    fn retain_attempts(&mut self, _live: &[String]) {}
+
     fn submit(&mut self, request: &EngineRequest) -> Result<(), EngineError>;
     /// `Some(true)` finished OK, `Some(false)` failed, `None` still running or unknown.
     fn finished(&mut self, attempt: &str) -> Option<bool>;
@@ -561,6 +597,13 @@ pub trait Engine {
 }
 
 impl<E: Engine + ?Sized> Engine for Box<E> {
+    fn readiness(&mut self) -> Option<bool> {
+        (**self).readiness()
+    }
+    fn retain_attempts(&mut self, live: &[String]) {
+        (**self).retain_attempts(live);
+    }
+
     fn submit(&mut self, request: &EngineRequest) -> Result<(), EngineError> {
         (**self).submit(request)
     }

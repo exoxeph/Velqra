@@ -38,8 +38,10 @@ pub struct RuntimeConfig {
     pub allowed: Vec<String>,
     /// Used when `settings.json` names no destination folder.
     pub download_root: PathBuf,
-    /// The pinned aria2 executable; without it the loopback stand-in engine is used (development).
+    /// The pinned aria2 executable. Missing/unusable engines refuse capture.
     pub aria2: Option<PathBuf>,
+    /// Test-only simulation opt-in, read from VELQRA_ALLOW_LOOPBACK=1.
+    pub allow_loopback: bool,
     /// Length of one server tick in milliseconds (100 in production; tests shorten it).
     pub tick_ms: u64,
 }
@@ -52,6 +54,7 @@ impl RuntimeConfig {
             std::env::var("USERPROFILE").ok().as_deref(),
             &home,
         );
+        let allow_loopback = std::env::var("VELQRA_ALLOW_LOOPBACK").as_deref() == Ok("1");
         Ok(Self {
             home,
             pipe: crate::paths::pipe_name()?,
@@ -59,14 +62,40 @@ impl RuntimeConfig {
             download_root,
             aria2: std::env::var_os("VELQRA_ARIA2")
                 .filter(|v| !v.is_empty())
-                .map(PathBuf::from),
+                .map(PathBuf::from)
+                .or_else(|| (!allow_loopback).then(dev_aria2).flatten()),
+            allow_loopback,
             tick_ms: 100,
         })
     }
 }
 
-/// M1a has no real transfer engine: tasks are accepted and finished at once, so the ownership path
-/// can be exercised end to end. The aria2 adapter arrives in M1b.
+/// Only an exact build-time repository path is searched in debug builds; never PATH or cwd.
+fn dev_aria2() -> Option<PathBuf> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../vendor/aria2/1.37.0/aria2c.exe");
+    crate::aria2::process::verify_executable(&path, PINNED_ARIA2_SHA256)
+        .ok()
+        .map(|()| path)
+}
+
+struct UnavailableEngine;
+impl Engine for UnavailableEngine {
+    fn readiness(&mut self) -> Option<bool> {
+        Some(false)
+    }
+    fn submit(&mut self, _: &EngineRequest) -> Result<(), EngineError> {
+        Err(EngineError::ReplyLost)
+    }
+    fn finished(&mut self, _: &str) -> Option<bool> {
+        None
+    }
+}
+
+/// Simulation engine for explicitly opted-in tests. It never transfers bytes.
 pub struct LoopbackEngine;
 
 impl Engine for LoopbackEngine {
@@ -120,8 +149,10 @@ impl Runtime {
         // the folder is the user's own setting (or our default), never something a page named
         let _ = std::fs::create_dir_all(&policy.root);
         let limits = loaded.settings.limits.clone();
+        let segments = loaded.settings.segments;
         let engine_root = policy.root.clone();
         let aria2_exe = cfg.aria2.clone();
+        let allow_loopback = cfg.allow_loopback;
         let run_dir = cfg.home.join("aria2-run");
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -135,7 +166,8 @@ impl Runtime {
                 .spawn(move || {
                     // built here because the core is deliberately not Send: exactly one thread ever touches it
                     let backend = {
-                        let (engine, name): (Box<dyn Engine>, &str) = match aria2_exe {
+                        let (engine, name, capable): (Box<dyn Engine>, &str, bool) = match aria2_exe
+                        {
                             Some(exe) => {
                                 let launch = Launch {
                                     exe,
@@ -146,24 +178,26 @@ impl Runtime {
                                     ready_timeout: Duration::from_secs(5),
                                 };
                                 let cfg = Aria2Config {
-                                    split: limits.per_origin,
-                                    per_origin: limits.per_origin,
+                                    split: segments,
+                                    per_origin: segments,
                                 };
+                                let mut supervisor = Aria2Supervisor::new(launch, cfg);
+                                let capable = supervisor.ready();
                                 (
-                                    Box::new(Guarded::new(
-                                        Aria2Supervisor::new(launch, cfg),
-                                        engine_root,
-                                    )),
+                                    Box::new(Guarded::new(supervisor, engine_root)),
                                     "aria2",
+                                    capable,
                                 )
                             }
-                            None => (Box::new(LoopbackEngine), "loopback"),
+                            None if allow_loopback => (Box::new(LoopbackEngine), "loopback", true),
+                            None => (Box::new(UnavailableEngine), "unavailable", false),
                         };
                         CoreBackend::new(
                             Core::with_vault(store, Box::new(vault))
                                 .with_limits(limits.max_active, limits.per_origin)
                                 .with_poll_interval(1)
                                 .with_settings(loaded)
+                                .with_transfer_capability(capable)
                                 .with_destination(policy),
                             engine,
                             name,
@@ -353,5 +387,89 @@ pub fn run_forever(cfg: RuntimeConfig) -> io::Result<()> {
     let _rt = Runtime::start(cfg)?;
     loop {
         thread::park();
+    }
+}
+
+#[cfg(all(test, windows))]
+#[path = "../tests/common/mod.rs"]
+mod test_common;
+
+#[cfg(all(test, windows))]
+mod review_tests {
+    use super::test_common::*;
+    use super::*;
+    use velqra_protocol::*;
+    #[test]
+    fn actual_runtime_settings_send_one_connection_to_aria2() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            settings_path(home.path()),
+            br#"{"limits":{"max_active":2,"per_origin":16}}"#,
+        )
+        .unwrap();
+        let pipe = velqra_ipc::pipe_name(&format!("review28-{}", std::process::id())).unwrap();
+        let exe = dev_aria2().expect("pinned dev binary required for this regression");
+        let rt = Runtime::start(RuntimeConfig {
+            home: home.path().into(),
+            pipe: pipe.clone(),
+            allowed: vec![velqra_bridge::testkit::ORIGIN.into()],
+            download_root: home.path().join("downloads"),
+            aria2: Some(exe),
+            allow_loopback: false,
+            tick_ms: 5,
+        })
+        .unwrap();
+        let mut c = Client::new(PipeTransport::connect(&pipe).unwrap());
+        c.handshake(
+            &crate::paths::load_secret(home.path()).unwrap().unwrap(),
+            velqra_bridge::testkit::ORIGIN,
+            [28; 16],
+            true,
+        )
+        .unwrap();
+        let mut p = prepare_body();
+        // Keep a real loopback task active while querying the options aria2 accepted.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        p.url = format!(
+            "http://127.0.0.1:{}/review28.bin",
+            listener.local_addr().unwrap().port()
+        );
+        p.filename = "review28.bin".into();
+        let receipt = receipt_of(
+            &c.request("p", "runtime-options", Message::Prepare(p))
+                .unwrap(),
+        );
+        c.request(
+            "a",
+            "runtime-options",
+            Message::BeginHandoff(receipt.as_ref()),
+        )
+        .unwrap();
+        c.request(
+            "c",
+            "runtime-options",
+            Message::Commit(CommitBody {
+                cancel: CancelEvidence::Confirmed,
+                receipt: receipt.as_ref(),
+            }),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let options = loop {
+            let options = crate::aria2::adapter::SENT_OPTIONS
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|v| v["out"] == "review28.bin.velqra-part")
+                .cloned();
+            if let Some(options) = options {
+                break options;
+            }
+            assert!(Instant::now() < deadline, "no addUri observed");
+            thread::sleep(Duration::from_millis(10));
+        };
+        rt.stop();
+        assert_eq!(options["split"], "1");
+        assert_eq!(options["max-connection-per-server"], "1");
     }
 }

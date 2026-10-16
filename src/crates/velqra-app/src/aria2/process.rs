@@ -45,6 +45,7 @@ pub enum LaunchError {
 }
 
 pub struct Aria2Process {
+    launch_args: Vec<String>,
     child: Child,
     addr: SocketAddr,
     secret: String,
@@ -90,11 +91,28 @@ pub(crate) fn args_for(conf: &Path, port: u16, l: &Launch) -> Vec<String> {
 
 /// Hashes the file with a read cap and compares it with the pinned value.
 pub fn verify_executable(path: &Path, expected_sha256: &str) -> Result<(), LaunchError> {
+    open_verified_executable(path, expected_sha256).map(drop)
+}
+
+/// The returned handle must survive process creation, including every spawn retry.
+fn open_verified_executable(
+    path: &Path,
+    expected_sha256: &str,
+) -> Result<std::fs::File, LaunchError> {
     const MAX_EXE: u64 = 64 * 1024 * 1024;
-    let file = std::fs::File::open(path).map_err(|_| LaunchError::BadExecutable("cannot open"))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(1); // FILE_SHARE_READ only: deny write and delete before hashing.
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|_| LaunchError::BadExecutable("cannot open"))?;
     let mut hasher = Sha256::new();
     let mut taken = 0u64;
-    let mut reader = file.take(MAX_EXE + 1);
+    let mut reader = (&mut file).take(MAX_EXE + 1);
     let mut buf = [0u8; 64 * 1024];
     loop {
         let n = reader
@@ -110,7 +128,7 @@ pub fn verify_executable(path: &Path, expected_sha256: &str) -> Result<(), Launc
         return Err(LaunchError::BadExecutable("too large"));
     }
     if hex(&hasher.finalize()).eq_ignore_ascii_case(expected_sha256) {
-        Ok(())
+        Ok(file)
     } else {
         Err(LaunchError::BadExecutable("not the pinned build"))
     }
@@ -122,7 +140,15 @@ fn hex(bytes: &[u8]) -> String {
 
 impl Aria2Process {
     pub fn spawn(l: &Launch) -> Result<Aria2Process, LaunchError> {
-        verify_executable(&l.exe, &l.expected_sha256)?;
+        Self::spawn_with_hook(l, || {})
+    }
+
+    fn spawn_with_hook(
+        l: &Launch,
+        after_verify: impl FnOnce(),
+    ) -> Result<Aria2Process, LaunchError> {
+        let _verified = open_verified_executable(&l.exe, &l.expected_sha256)?;
+        after_verify();
         // the secret file lives here for a moment: no inherited access list, current user only
         velqra_ipc::make_private_dir(&l.run_dir).map_err(|_| LaunchError::Io("run folder"))?;
         let mut last = LaunchError::NotReady("not started");
@@ -155,7 +181,8 @@ impl Aria2Process {
         write_new(&conf, conf_text(&secret).as_bytes()).map_err(|_| LaunchError::Io("config"))?;
 
         let mut cmd = Command::new(&l.exe);
-        cmd.args(args_for(&conf, port, l))
+        let launch_args = args_for(&conf, port, l);
+        cmd.args(&launch_args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -202,6 +229,7 @@ impl Aria2Process {
                 fail(&mut child, LaunchError::Io("config could not be removed"))
             }
             Ok(_) => Ok(Aria2Process {
+                launch_args,
                 child,
                 addr,
                 secret,
@@ -211,6 +239,12 @@ impl Aria2Process {
 
     pub fn client(&self, timeout: Duration) -> RpcClient {
         RpcClient::new(self.addr, self.secret.clone(), timeout)
+    }
+
+    /// Exact arguments supplied to Command::spawn; no RPC secret is permitted in this list.
+    /// This is construction evidence, not independent OS command-line introspection.
+    pub fn launch_args(&self) -> &[String] {
+        &self.launch_args
     }
 
     pub fn pid(&self) -> u32 {
@@ -257,6 +291,35 @@ mod tests {
             parent_pid: 4242,
             ready_timeout: Duration::from_secs(5),
         }
+    }
+
+    #[test]
+    fn verified_executable_cannot_be_written_or_renamed_before_spawn() {
+        let d = tempfile::tempdir().unwrap();
+        let exe = d.path().join("aria2c.exe");
+        let vendor =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../vendor/aria2/1.37.0/aria2c.exe");
+        std::fs::copy(vendor, &exe).unwrap();
+        let l = Launch {
+            exe: exe.clone(),
+            run_dir: d.path().join("run"),
+            parent_pid: std::process::id(),
+            ..launch()
+        };
+        let mut process = Aria2Process::spawn_with_hook(&l, || {
+            assert!(
+                std::fs::rename(&exe, d.path().join("replaced.exe")).is_err(),
+                "verified executable can be replaced at spawn boundary"
+            );
+            assert!(
+                std::fs::OpenOptions::new().write(true).open(&exe).is_err(),
+                "verified executable can be modified at spawn boundary"
+            );
+        })
+        .unwrap();
+        assert!(process.is_alive());
+        process.stop();
+        std::fs::rename(&exe, d.path().join("after-stop.exe")).unwrap();
     }
 
     #[test]

@@ -23,12 +23,18 @@ pub enum RemoteKind {
     Other,
 }
 
-pub(crate) fn classify(message: &str) -> RemoteKind {
-    let m = message.to_ascii_lowercase();
-    if m.contains("unauthorized") {
-        RemoteKind::Unauthorized
-    } else if m.contains("not found") {
+pub(crate) fn classify(code: i64, message: &str, gid: Option<&str>) -> RemoteKind {
+    // Measured against pinned 1.37.0; even a grammatically valid error for another GID is not absence.
+    if code == 1
+        && gid.is_some_and(|g| {
+            g.len() == 16
+                && g.bytes().all(|b| b.is_ascii_hexdigit())
+                && message == format!("GID {g} is not found")
+        })
+    {
         RemoteKind::NotFound
+    } else if message == "Unauthorized" {
+        RemoteKind::Unauthorized
     } else {
         RemoteKind::Other
     }
@@ -64,6 +70,18 @@ impl RpcClient {
         let deadline = Instant::now() + self.timeout;
         let id = format!("velqra-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed));
         let mut all = vec![Value::String(format!("token:{}", self.secret))];
+        let expected_gid = if matches!(
+            method,
+            "aria2.tellStatus"
+                | "aria2.pause"
+                | "aria2.unpause"
+                | "aria2.forceRemove"
+                | "aria2.removeDownloadResult"
+        ) {
+            params.first().and_then(Value::as_str).map(str::to_owned)
+        } else {
+            None
+        };
         all.extend(params);
         let body = serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": all})
             .to_string();
@@ -160,13 +178,33 @@ impl RpcClient {
             return Err(RpcError::BadReply("wrong envelope"));
         }
         match (reply.get("result"), reply.get("error")) {
-            (Some(result), None) => Ok(result.clone()),
+            (Some(result), None) => {
+                let valid = match method {
+                    "aria2.pause" | "aria2.unpause" | "aria2.forceRemove" => expected_gid
+                        .as_deref()
+                        .is_some_and(|g| result.as_str() == Some(g)),
+                    "aria2.removeDownloadResult" | "aria2.shutdown" | "aria2.forceShutdown" => {
+                        result.as_str() == Some("OK")
+                    }
+                    "aria2.addUri" => result.as_str().is_some_and(|g| {
+                        g.len() == 16
+                            && g.bytes().all(|b| b.is_ascii_hexdigit())
+                            && g != "0000000000000000"
+                    }),
+                    _ => true, // Other methods' typed callers validate their payloads.
+                };
+                if valid {
+                    Ok(result.clone())
+                } else {
+                    Err(RpcError::BadReply("invalid method result"))
+                }
+            }
             (None, Some(err)) => match err.get("code").and_then(Value::as_i64) {
                 Some(code) => {
                     let text = err.get("message").and_then(Value::as_str).unwrap_or("");
                     Err(RpcError::Remote {
                         code,
-                        kind: classify(text),
+                        kind: classify(code, text, expected_gid.as_deref()),
                     })
                 }
                 None => Err(RpcError::BadReply("bad error object")),
@@ -290,6 +328,102 @@ mod tests {
     }
 
     #[test]
+    fn control_envelopes_require_exact_gid_or_uppercase_ok() {
+        for method in [
+            "aria2.pause",
+            "aria2.unpause",
+            "aria2.forceRemove",
+            "aria2.removeDownloadResult",
+            "aria2.shutdown",
+            "aria2.forceShutdown",
+        ] {
+            for result in [
+                json!(null),
+                json!(1),
+                json!({}),
+                json!("ok"),
+                json!("ffffffffffffffff"),
+            ] {
+                let (addr, _) = serve(one(move |r| ok_reply(r, result)));
+                assert!(matches!(
+                    client(addr).call(method, vec![json!("0123456789abcdef")]),
+                    Err(RpcError::BadReply(_))
+                ));
+            }
+            let want = if method.contains("Shutdown")
+                || method.ends_with("shutdown")
+                || method.ends_with("DownloadResult")
+            {
+                "OK"
+            } else {
+                "0123456789abcdef"
+            };
+            let (addr, _) = serve(one(move |r| ok_reply(r, json!(want))));
+            assert_eq!(
+                client(addr)
+                    .call(method, vec![json!("0123456789abcdef")])
+                    .unwrap(),
+                json!(want)
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_gid_requires_measured_grammar_code_method_and_requested_identity() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/aria2-1.37.0-rpc.json"))
+                .unwrap();
+        for method in [
+            "aria2.tellStatus",
+            "aria2.pause",
+            "aria2.unpause",
+            "aria2.forceRemove",
+            "aria2.removeDownloadResult",
+        ] {
+            let e = &fixture[method]["error"];
+            assert_eq!(
+                classify(
+                    e["code"].as_i64().unwrap(),
+                    e["message"].as_str().unwrap(),
+                    Some("0123456789abcdef")
+                ),
+                RemoteKind::NotFound
+            );
+        }
+        for (code, text, gid) in [
+            (
+                2,
+                "GID 0123456789abcdef is not found",
+                Some("0123456789abcdef"),
+            ),
+            (
+                1,
+                "GID 0123456789abcdef is not found",
+                Some("ffffffffffffffff"),
+            ),
+            (
+                1,
+                "GID 0123456789abcdef is not found.",
+                Some("0123456789abcdef"),
+            ),
+            (1, "file not found", Some("0123456789abcdef")),
+            (1, "GID 0123456789abcdef is not found", None),
+        ] {
+            assert_eq!(classify(code, text, gid), RemoteKind::Other);
+        }
+        let (addr, _) = serve(one(|r| {
+            http("400 Bad Request", &json!({"jsonrpc":"2.0","id":r["id"],"error":{"code":1,"message":"GID 0123456789abcdef is not found"}}).to_string())
+        }));
+        assert_eq!(
+            client(addr).call("aria2.tellStatus", vec![json!("ffffffffffffffff")]),
+            Err(RpcError::Remote {
+                code: 1,
+                kind: RemoteKind::Other
+            })
+        );
+    }
+
+    #[test]
     fn a_call_posts_json_rpc_with_the_secret_only_as_the_token_parameter() {
         let (addr, seen) = serve(one(|req| ok_reply(req, json!("0123456789abcdef"))));
         let out = client(addr)
@@ -344,7 +478,7 @@ mod tests {
         let kinds = [
             ("GID 1234567890abcdef is not found", RemoteKind::NotFound),
             ("Unauthorized", RemoteKind::Unauthorized),
-            ("UNAUTHORIZED access", RemoteKind::Unauthorized),
+            ("UNAUTHORIZED access", RemoteKind::Other),
             ("Failed to parse URI", RemoteKind::Other),
             ("", RemoteKind::Other),
         ];
@@ -357,7 +491,9 @@ mod tests {
                         .to_string(),
                 )
             }));
-            let err = client(addr).call("m", vec![]).unwrap_err();
+            let err = client(addr)
+                .call("aria2.tellStatus", vec![json!("1234567890abcdef")])
+                .unwrap_err();
             assert_eq!(
                 err,
                 RpcError::Remote {

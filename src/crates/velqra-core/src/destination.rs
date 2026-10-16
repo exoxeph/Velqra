@@ -49,6 +49,9 @@ pub fn default_categories() -> Vec<Category> {
 
 /// How many " (n)" suffixes are tried before Prepare gives up.
 const MAX_SUFFIX: u32 = 999;
+/// .velqra-part (12) + .stale-9999 (11) + .aria2 (6).
+pub const INTERNAL_SUFFIX_UNITS: usize = 29;
+pub const MAX_FINAL_NAME_UNITS: usize = MAX_NAME_UNITS - INTERNAL_SUFFIX_UNITS;
 
 impl DestinationPolicy {
     pub fn new(root: PathBuf) -> Self {
@@ -111,6 +114,9 @@ impl DestinationPolicy {
         // junction above the root or a drive letter mapped onto it must not open a second fence.
         let real_root = self.root.canonicalize().ok()?;
         let name = sanitize_filename(filename);
+        if name.encode_utf16().count() > MAX_FINAL_NAME_UNITS {
+            return None;
+        }
         let folder = self.category_for(&name).to_string();
         let dir = self.root.join(&folder);
         let (stem, ext) = match name.rfind('.') {
@@ -153,7 +159,7 @@ impl DestinationPolicy {
 /// `stem (n).ext`, with the stem shortened so the whole name stays within 255 UTF-16 units.
 fn suffixed(stem: &str, ext: &str, n: u32) -> Option<String> {
     let tail = format!(" ({n}){ext}");
-    let room = MAX_NAME_UNITS.checked_sub(tail.encode_utf16().count())?;
+    let room = MAX_FINAL_NAME_UNITS.checked_sub(tail.encode_utf16().count())?;
     let mut kept = String::new();
     let mut units = 0;
     for c in stem.chars() {
@@ -278,10 +284,10 @@ mod tests {
     }
 
     #[test]
-    fn a_long_name_with_a_suffix_still_fits_in_255_units() {
+    fn a_long_name_with_a_suffix_preserves_the_internal_budget() {
         let d = tempfile::tempdir().unwrap();
         let p = policy(d.path());
-        let long = format!("{}.zip", "x".repeat(300));
+        let long = format!("{}.zip", "x".repeat(222));
         let first = p.choose(&long, &none).unwrap();
         let held_key = first.key.clone();
         let second = p.choose(&long, &|k: &str| k == held_key).unwrap();
@@ -291,7 +297,11 @@ mod tests {
                 .unwrap()
                 .to_string_lossy()
                 .into_owned();
-            assert!(name.encode_utf16().count() <= 255, "{}", name.len());
+            assert!(
+                name.encode_utf16().count() <= MAX_FINAL_NAME_UNITS,
+                "{}",
+                name.len()
+            );
             assert!(name.ends_with(".zip"));
         }
         assert_ne!(first.key, second.key);

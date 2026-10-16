@@ -155,7 +155,10 @@ fn a_second_lost_reply_after_the_resubmission_holds_the_task_after_the_query_bud
     assert_eq!(reason(&c).as_deref(), Some("engine identity unprovable"));
     let calls = e.status_calls;
     c.pump(&mut e).unwrap();
-    assert_eq!(e.status_calls, calls, "a held task is not polled again");
+    assert_eq!(
+        e.status_calls, calls,
+        "definitively absent held task needs no further polling"
+    );
 }
 
 #[test]
@@ -253,13 +256,20 @@ fn the_hold_comes_exactly_at_the_fifth_unanswered_question() {
     for _ in 0..5 {
         e.statuses.push_back(Err(EngineError::ReplyLost));
     }
-    e.statuses.push_back(Ok(EngineStatus::Paused)); // would be adopted if the task were not held
-    for _ in 0..8 {
+    c.pump(&mut e).unwrap();
+    for _ in 0..4 {
         c.pump(&mut e).unwrap();
     }
+    assert!(!c.store.get_by_task(1).unwrap().unwrap().held);
+    c.pump(&mut e).unwrap();
+    assert!(c.store.get_by_task(1).unwrap().unwrap().held);
     assert_eq!(e.status_calls, 5);
-    assert_eq!(state(&c), TaskState::Committed);
     assert_eq!(reason(&c).as_deref(), Some("engine identity unprovable"));
+    e.statuses.push_back(Ok(EngineStatus::Paused));
+    c.pump(&mut e).unwrap();
+    assert_eq!(state(&c), TaskState::Transferring);
+    assert!(!c.store.get_by_task(1).unwrap().unwrap().held);
+    assert_eq!(e.status_calls, 6);
 }
 
 fn transferring_core(e: &mut Scripted) -> Core<MemStore> {

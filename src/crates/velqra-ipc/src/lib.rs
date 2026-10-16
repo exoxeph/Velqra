@@ -6,6 +6,8 @@ use std::io;
 
 mod protect;
 pub use protect::DpapiProtector;
+mod containment;
+pub use containment::DirectoryLease;
 
 #[cfg(windows)]
 mod win;

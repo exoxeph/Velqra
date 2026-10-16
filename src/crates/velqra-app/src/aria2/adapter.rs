@@ -12,10 +12,18 @@ use velqra_protocol::download_url::parse_download_url;
 
 /// Anything that can make one JSON-RPC call; the real client or a scripted fake.
 pub trait Rpc {
+    #[cfg(test)]
+    fn observe_accepted_options(&self, _gid: &str) {}
     fn call(&self, method: &str, params: Vec<Value>) -> Result<Value, RpcError>;
 }
 
 impl Rpc for RpcClient {
+    #[cfg(test)]
+    fn observe_accepted_options(&self, gid: &str) {
+        if let Ok(options) = self.call("aria2.getOption", vec![json!(gid)]) {
+            SENT_OPTIONS.lock().unwrap().push(options);
+        }
+    }
     fn call(&self, method: &str, params: Vec<Value>) -> Result<Value, RpcError> {
         RpcClient::call(self, method, params)
     }
@@ -126,11 +134,12 @@ impl<R: Rpc> Aria2Engine<R> {
     }
 
     fn tell_status(&self, attempt: &str) -> Result<Value, RpcError> {
-        self.rpc.call(
+        let value = self.rpc.call(
             "aria2.tellStatus",
             vec![
                 json!(gid_for(attempt)),
                 json!([
+                    "gid",
                     "status",
                     "completedLength",
                     "totalLength",
@@ -138,12 +147,15 @@ impl<R: Rpc> Aria2Engine<R> {
                     "errorMessage"
                 ]),
             ],
-        )
+        )?;
+        validate_status(&value, &gid_for(attempt))?;
+        Ok(value)
     }
 
     fn control(&self, method: &str, attempt: &str) -> Result<(), EngineError> {
         match self.rpc.call(method, vec![json!(gid_for(attempt))]) {
-            Ok(_) => Ok(()),
+            Ok(Value::String(got)) if got == gid_for(attempt) => Ok(()),
+            Ok(_) => Err(EngineError::ReplyLost),
             // a task that is already gone has nothing left to pause, resume or remove
             Err(RpcError::Remote {
                 kind: RemoteKind::NotFound,
@@ -155,13 +167,37 @@ impl<R: Rpc> Aria2Engine<R> {
 }
 
 fn number(v: &Value, key: &str) -> Option<u64> {
-    v.get(key)?.as_str()?.parse().ok()
+    let s = v.get(key)?.as_str()?;
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+fn validate_status(v: &Value, gid: &str) -> Result<(), RpcError> {
+    let bad = RpcError::BadReply("invalid task result");
+    if v.get("gid").and_then(Value::as_str) != Some(gid)
+        || number(v, "completedLength").is_none()
+        || number(v, "totalLength").is_none()
+        || !matches!(
+            v.get("status").and_then(Value::as_str),
+            Some("active" | "waiting" | "paused" | "complete" | "error" | "removed")
+        )
+        || (v.get("errorCode").is_some() && number(v, "errorCode").is_none())
+        || (v.get("errorMessage").is_some() && v["errorMessage"].as_str().is_none())
+        || (v["status"] == "error"
+            && (number(v, "errorCode").is_none() || v["errorMessage"].as_str().is_none()))
+    {
+        return Err(bad);
+    }
+    Ok(())
 }
 
 /// True when an errored aria2 task stopped for a reason that may pass. aria2's error codes: 2 time
 /// out, 5 too slow, 6 network problem, 19 name resolution failed, 29 server overloaded; code 22 is
-/// "unexpected HTTP status", of which only 408, 429 and the 5xx gateway family are worth another try
-/// (other 4xx will answer the same way again). The message is read for that one number and dropped.
+/// "unexpected HTTP status": ONLY 408/429/500/502/503/504 are retried. No other 5xx is included.
+/// Measured transient codes are 1 (refused/drop), 22 (408/429/500) and 29 (502/503/504).
+/// Codes 2/5/6/19 remain policy mappings, not pinned-build measurements. Raw text is dropped.
 fn error_is_transient(v: &Value) -> bool {
     let code = v.get("errorCode").and_then(Value::as_str).unwrap_or("");
     match code {
@@ -176,13 +212,15 @@ fn error_is_transient(v: &Value) -> bool {
             let message = v.get("errorMessage").and_then(Value::as_str).unwrap_or("");
             let status = message
                 .rsplit_once("status=")
-                .and_then(|(_, tail)| tail.get(..3))
-                .and_then(|n| n.parse::<u16>().ok());
+                .and_then(|(_, tail)| tail.parse::<u16>().ok());
             matches!(status, Some(408 | 429 | 500 | 502 | 503 | 504))
         }
         _ => false,
     }
 }
+
+#[cfg(test)]
+pub(crate) static SENT_OPTIONS: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
 
 impl<R: Rpc> Engine for Aria2Engine<R> {
     fn submit(&mut self, req: &EngineRequest) -> Result<(), EngineError> {
@@ -191,8 +229,12 @@ impl<R: Rpc> Engine for Aria2Engine<R> {
         };
         let gid = gid_for(&req.attempt);
         match self.rpc.call("aria2.addUri", params) {
-            Ok(Value::String(got)) if got == gid => Ok(()),
-            Ok(_) => Err(EngineError::Rejected),
+            Ok(Value::String(got)) if got == gid => {
+                #[cfg(test)]
+                self.rpc.observe_accepted_options(&gid);
+                Ok(())
+            }
+            Ok(_) => Err(EngineError::ReplyLost),
             Err(RpcError::Remote { .. }) => {
                 // "already exists" is success: the same attempt id means the same task
                 match self.tell_status(&req.attempt) {
@@ -220,8 +262,8 @@ impl<R: Rpc> Engine for Aria2Engine<R> {
         match self.tell_status(attempt) {
             Ok(v) => match v.get("status").and_then(Value::as_str) {
                 Some("active" | "waiting") => Ok(EngineStatus::Active {
-                    done: number(&v, "completedLength").unwrap_or(0),
-                    total: number(&v, "totalLength").unwrap_or(0),
+                    done: number(&v, "completedLength").ok_or(EngineError::ReplyLost)?,
+                    total: number(&v, "totalLength").ok_or(EngineError::ReplyLost)?,
                 }),
                 Some("paused") => Ok(EngineStatus::Paused),
                 Some("complete") => Ok(EngineStatus::Done),
@@ -333,6 +375,83 @@ mod tests {
 
     fn engine(fake: &Fake) -> Aria2Engine<&Fake> {
         Aria2Engine::new(fake, Aria2Config::default())
+    }
+
+    #[test]
+    fn pinned_build_http_error_fixtures_match_the_exact_retry_policy() {
+        let rows: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/aria2-1.37.0-http-errors.json"
+        ))
+        .unwrap();
+        for row in rows.as_array().unwrap() {
+            let v = &row["reply"]["result"];
+            assert_eq!(
+                error_is_transient(v),
+                matches!(
+                    row["http_status"].as_u64(),
+                    Some(408 | 429 | 500 | 502 | 503 | 504)
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_numbers_and_duplicate_status_identity_are_never_adopted() {
+        for key in ["completedLength", "totalLength", "errorCode"] {
+            for bad in [
+                json!(null),
+                json!([]),
+                json!({}),
+                json!(true),
+                json!(22),
+                json!(""),
+                json!("-1"),
+                json!("+1"),
+                json!(" 1"),
+                json!("1.0"),
+                json!("18446744073709551616"),
+            ] {
+                let mut v = status_fixture(json!({"status":"error"}));
+                v[key] = bad;
+                let fake = Fake::with(vec![Ok(v)]);
+                assert_eq!(
+                    engine(&fake).status("t1-g1"),
+                    Err(EngineError::ReplyLost),
+                    "{key}"
+                );
+            }
+        }
+        let fake = Fake::with(vec![Err(OTHER), Ok(json!({"status":"active"}))]);
+        assert_eq!(
+            engine(&fake).submit(&request()),
+            Err(EngineError::ReplyLost)
+        );
+    }
+
+    #[test]
+    fn hostile_result_shapes_are_ambiguity_never_success_or_zero() {
+        for v in [
+            json!(null),
+            json!(true),
+            json!("OK"),
+            json!("ffffffffffffffff"),
+        ] {
+            let fake = Fake::with(vec![Ok(v.clone())]);
+            assert_eq!(
+                engine(&fake).submit(&request()),
+                Err(EngineError::ReplyLost)
+            );
+            let fake = Fake::with(vec![Ok(v)]);
+            assert_eq!(engine(&fake).pause("t1-g1"), Err(EngineError::ReplyLost));
+        }
+        for v in [
+            json!({"status":"active"}),
+            json!({"gid":gid_for("t1-g1"),"status":"active","completedLength":"bad","totalLength":"1"}),
+            json!({"gid":"ffffffffffffffff","status":"complete","completedLength":"1","totalLength":"1"}),
+        ] {
+            let fake = Fake::with(vec![Ok(v)]);
+            assert_eq!(engine(&fake).status("t1-g1"), Err(EngineError::ReplyLost));
+        }
     }
 
     #[test]
@@ -469,18 +588,38 @@ mod tests {
     }
 
     #[test]
-    fn an_unexpected_gid_in_the_reply_is_a_rejection() {
+    fn an_unexpected_gid_in_the_reply_is_ambiguous() {
         let fake = Fake::with(vec![Ok(json!("ffffffffffffffff"))]);
-        assert_eq!(engine(&fake).submit(&request()), Err(EngineError::Rejected));
+        assert_eq!(
+            engine(&fake).submit(&request()),
+            Err(EngineError::ReplyLost)
+        );
         let fake = Fake::with(vec![Ok(json!(42))]);
-        assert_eq!(engine(&fake).submit(&request()), Err(EngineError::Rejected));
+        assert_eq!(
+            engine(&fake).submit(&request()),
+            Err(EngineError::ReplyLost)
+        );
+    }
+
+    fn status_fixture(mut v: Value) -> Value {
+        let o = v.as_object_mut().unwrap();
+        o.insert("gid".into(), json!(gid_for("t1-g1")));
+        o.entry("completedLength").or_insert(json!("0"));
+        o.entry("totalLength").or_insert(json!("0"));
+        if o.get("status") == Some(&json!("error")) {
+            o.entry("errorCode").or_insert(json!("3"));
+            o.entry("errorMessage").or_insert(json!("failure"));
+        }
+        v
     }
 
     #[test]
     fn an_already_existing_task_counts_as_success_because_the_attempt_id_is_the_identity() {
         let fake = Fake::with(vec![
             Err(OTHER),
-            Ok(json!({"status":"active","completedLength":"1","totalLength":"2"})),
+            Ok(status_fixture(
+                json!({"status":"active","completedLength":"1","totalLength":"2"}),
+            )),
         ]);
         assert_eq!(engine(&fake).submit(&request()), Ok(()));
         assert_eq!(fake.methods(), ["aria2.addUri", "aria2.tellStatus"]);
@@ -511,27 +650,33 @@ mod tests {
         let failed = EngineStatus::Failed("transfer failed".into());
         let cases = [
             (
-                json!({"status":"active","completedLength":"512","totalLength":"1024"}),
+                status_fixture(
+                    json!({"status":"active","completedLength":"512","totalLength":"1024"}),
+                ),
                 EngineStatus::Active {
                     done: 512,
                     total: 1024,
                 },
             ),
             (
-                json!({"status":"waiting","completedLength":"0","totalLength":"0"}),
+                status_fixture(json!({"status":"waiting","completedLength":"0","totalLength":"0"})),
                 EngineStatus::Active { done: 0, total: 0 },
             ),
-            (json!({"status":"paused"}), EngineStatus::Paused),
-            (json!({"status":"complete"}), EngineStatus::Done),
             (
-                json!({"status":"error","errorMessage":"GET https://secret.example/t=1 failed"}),
+                status_fixture(json!({"status":"paused"})),
+                EngineStatus::Paused,
+            ),
+            (
+                status_fixture(json!({"status":"complete"})),
+                EngineStatus::Done,
+            ),
+            (
+                status_fixture(
+                    json!({"status":"error","errorMessage":"GET https://secret.example/t=1 failed"}),
+                ),
                 failed.clone(),
             ),
-            (json!({"status":"removed"}), failed),
-            (
-                json!({"status":"active","completedLength":"x","totalLength":"-1"}),
-                EngineStatus::Active { done: 0, total: 0 },
-            ),
+            (status_fixture(json!({"status":"removed"})), failed),
         ];
         for (reply, want) in cases {
             let fake = Fake::with(vec![Ok(reply.clone())]);
@@ -543,7 +688,7 @@ mod tests {
     }
 
     fn errored(code: &str, message: &str) -> Value {
-        json!({"status": "error", "errorCode": code, "errorMessage": message})
+        status_fixture(json!({"status": "error", "errorCode": code, "errorMessage": message}))
     }
 
     #[test]
@@ -570,12 +715,12 @@ mod tests {
         for reply in transient {
             let fake = Fake::with(vec![Ok(reply.clone())]);
             assert_eq!(
-                engine(&fake).status("a"),
+                engine(&fake).status("t1-g1"),
                 Ok(EngineStatus::Interrupted),
                 "{reply}"
             );
             let fake = Fake::with(vec![Ok(reply.clone())]);
-            assert_eq!(engine(&fake).poll("a"), Poll::Interrupted, "{reply}");
+            assert_eq!(engine(&fake).poll("t1-g1"), Poll::Interrupted, "{reply}");
         }
         let permanent = [
             errored("22", "The response status is not successful. status=403"),
@@ -593,30 +738,44 @@ mod tests {
             errored("24", "auth failed"),
             errored("1", "unknown"),
             errored("1", "Some other code one message"),
-            json!({"status": "error"}),
-            json!({"status": "error", "errorCode": 22}),
+            status_fixture(json!({"status": "error"})),
         ];
         for reply in permanent {
             let fake = Fake::with(vec![Ok(reply.clone())]);
             assert_eq!(
-                engine(&fake).status("a"),
+                engine(&fake).status("t1-g1"),
                 Ok(EngineStatus::Failed("transfer failed".into())),
                 "{reply}"
             );
             let fake = Fake::with(vec![Ok(reply.clone())]);
-            assert_eq!(engine(&fake).poll("a"), Poll::Failed, "{reply}");
+            assert_eq!(engine(&fake).poll("t1-g1"), Poll::Failed, "{reply}");
         }
     }
 
     #[test]
     fn poll_asks_aria2_once_and_maps_every_answer() {
         let cases = [
-            (Ok(json!({"status":"active"})), Poll::Running),
-            (Ok(json!({"status":"waiting"})), Poll::Running),
-            (Ok(json!({"status":"paused"})), Poll::Running),
-            (Ok(json!({"status":"complete"})), Poll::Done),
-            (Ok(json!({"status":"removed"})), Poll::Failed),
-            (Ok(json!({"status":"mystery"})), Poll::Unreachable),
+            (
+                Ok(status_fixture(json!({"status":"active"}))),
+                Poll::Running,
+            ),
+            (
+                Ok(status_fixture(json!({"status":"waiting"}))),
+                Poll::Running,
+            ),
+            (
+                Ok(status_fixture(json!({"status":"paused"}))),
+                Poll::Running,
+            ),
+            (Ok(status_fixture(json!({"status":"complete"}))), Poll::Done),
+            (
+                Ok(status_fixture(json!({"status":"removed"}))),
+                Poll::Failed,
+            ),
+            (
+                Ok(status_fixture(json!({"status":"mystery"}))),
+                Poll::Unreachable,
+            ),
             (Ok(json!("text")), Poll::Unreachable),
             (Err(NOT_FOUND), Poll::Forgotten),
             (Err(REFUSED), Poll::Unreachable),
@@ -633,12 +792,13 @@ mod tests {
 
     #[test]
     fn the_status_question_asks_for_the_error_fields_and_nothing_else_sensitive() {
-        let fake = Fake::with(vec![Ok(json!({"status":"active"}))]);
+        let fake = Fake::with(vec![Ok(status_fixture(json!({"status":"active"})))]);
         engine(&fake).poll("t1-g1");
         let keys = fake.calls.borrow()[0].1[1].clone();
         assert_eq!(
             keys,
             json!([
+                "gid",
                 "status",
                 "completedLength",
                 "totalLength",
@@ -651,7 +811,7 @@ mod tests {
     #[test]
     fn only_a_clean_not_found_means_unknown() {
         let fake = Fake::with(vec![Err(NOT_FOUND)]);
-        assert_eq!(engine(&fake).status("a"), Ok(EngineStatus::Unknown));
+        assert_eq!(engine(&fake).status("t1-g1"), Ok(EngineStatus::Unknown));
         for e in [
             REFUSED,
             OTHER,
@@ -660,44 +820,48 @@ mod tests {
         ] {
             let fake = Fake::with(vec![Err(e)]);
             assert_eq!(
-                engine(&fake).status("a"),
+                engine(&fake).status("t1-g1"),
                 Err(EngineError::ReplyLost),
                 "{e:?}"
             );
         }
-        for odd in [json!({"status":"mystery"}), json!({}), json!("text")] {
+        for odd in [
+            status_fixture(json!({"status":"mystery"})),
+            json!({}),
+            json!("text"),
+        ] {
             let fake = Fake::with(vec![Ok(odd)]);
-            assert_eq!(engine(&fake).status("a"), Err(EngineError::ReplyLost));
+            assert_eq!(engine(&fake).status("t1-g1"), Err(EngineError::ReplyLost));
         }
     }
 
     #[test]
     fn has_forgotten_is_true_only_when_aria2_says_it_has_never_heard_of_the_task() {
         let fake = Fake::with(vec![Err(NOT_FOUND)]);
-        assert!(engine(&fake).has_forgotten("a"));
+        assert!(engine(&fake).has_forgotten("t1-g1"));
         for reply in [
             Err(REFUSED),
             Err(RpcError::Transport("t")),
-            Ok(json!({"status":"active"})),
-            Ok(json!({"status":"complete"})),
+            Ok(status_fixture(json!({"status":"active"}))),
+            Ok(status_fixture(json!({"status":"complete"}))),
         ] {
             let fake = Fake::with(vec![reply]);
-            assert!(!engine(&fake).has_forgotten("a"));
+            assert!(!engine(&fake).has_forgotten("t1-g1"));
         }
     }
 
     #[test]
     fn finished_reports_only_terminal_states() {
         for (reply, want) in [
-            (Ok(json!({"status":"complete"})), Some(true)),
-            (Ok(json!({"status":"error"})), Some(false)),
-            (Ok(json!({"status":"active"})), None),
-            (Ok(json!({"status":"paused"})), None),
+            (Ok(status_fixture(json!({"status":"complete"}))), Some(true)),
+            (Ok(status_fixture(json!({"status":"error"}))), Some(false)),
+            (Ok(status_fixture(json!({"status":"active"}))), None),
+            (Ok(status_fixture(json!({"status":"paused"}))), None),
             (Err(NOT_FOUND), None),
             (Err(RpcError::Transport("t")), None),
         ] {
             let fake = Fake::with(vec![reply]);
-            assert_eq!(engine(&fake).finished("a"), want);
+            assert_eq!(engine(&fake).finished("t1-g1"), want);
         }
     }
 

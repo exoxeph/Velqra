@@ -26,7 +26,7 @@ pub struct SettingsError(pub &'static str);
 pub struct Limits {
     /// Downloads running at once.
     pub max_active: u32,
-    /// Connections-worth of downloads to one origin at once.
+    /// Download tasks to one origin at once.
     pub per_origin: u32,
 }
 
@@ -51,6 +51,8 @@ pub struct Settings {
     pub destination_root: Option<String>,
     pub categories: Vec<Category>,
     pub limits: Limits,
+    /// Segments/connections per transfer; independent from task scheduling, off at 1.
+    pub segments: u32,
 }
 
 impl Default for Settings {
@@ -67,6 +69,7 @@ impl Default for Settings {
             destination_root: None,
             categories: default_categories(),
             limits: Limits::default(),
+            segments: 1,
         }
     }
 }
@@ -126,6 +129,9 @@ impl Settings {
             if c.extensions.len() > MAX_SUFFIXES || !c.extensions.iter().all(|e| plain_suffix(e)) {
                 return bad("category suffixes must be lower-case letters and digits");
             }
+        }
+        if !(1..=16).contains(&self.segments) {
+            return bad("segments must be between 1 and 16");
         }
         let range = 1..=16;
         if !range.contains(&self.limits.max_active) || !range.contains(&self.limits.per_origin) {
@@ -188,6 +194,7 @@ impl Settings {
     /// The part the extension may see: no folders.
     pub fn snapshot(&self, problem: Option<&str>) -> SettingsSnapshot {
         SettingsSnapshot {
+            transfer_capable: true,
             mode: self.mode,
             extensions: self.extensions.clone(),
             excluded_sites: self.excluded_sites.clone(),
@@ -215,6 +222,18 @@ mod tests {
 
     fn parse(text: &str) -> Result<Settings, SettingsError> {
         Settings::parse(text.as_bytes())
+    }
+
+    #[test]
+    fn segmentation_is_separate_validated_and_defaults_off() {
+        assert_eq!(
+            parse(r#"{"limits":{"per_origin":16}}"#).unwrap().segments,
+            1
+        );
+        assert_eq!(parse(r#"{"segments":3}"#).unwrap().segments, 3);
+        for bad in ["0", "17", "-1", "true", "1.5"] {
+            assert!(parse(&format!("{{\"segments\":{bad}}}")).is_err());
+        }
     }
 
     #[test]

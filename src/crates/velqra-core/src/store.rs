@@ -110,6 +110,9 @@ pub struct Record {
     pub queued_reason: Option<String>,
     #[serde(default)]
     pub paused: bool,
+    /// User intent awaiting engine acknowledgement after an ambiguous submit.
+    #[serde(default)]
+    pub pending_pause: Option<String>,
     #[serde(default)]
     pub pause_reason: Option<String>,
     /// Attempts started again after a transient failure.
@@ -150,6 +153,7 @@ impl Record {
             priority: 0,
             queued_reason: None,
             paused: false,
+            pending_pause: None,
             pause_reason: None,
             retries: 0,
             retry_at: 0,

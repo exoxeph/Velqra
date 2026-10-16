@@ -1,0 +1,122 @@
+[
+  {
+    "http_status": 408,
+    "reply": {
+      "id": "measure",
+      "jsonrpc": "2.0",
+      "result": {
+        "completedLength": "0",
+        "errorCode": "22",
+        "errorMessage": "The response status is not successful. status=408",
+        "gid": "7f4241ed8d041227",
+        "status": "error",
+        "totalLength": "0"
+      }
+    }
+  },
+  {
+    "http_status": 429,
+    "reply": {
+      "id": "measure",
+      "jsonrpc": "2.0",
+      "result": {
+        "completedLength": "0",
+        "errorCode": "22",
+        "errorMessage": "The response status is not successful. status=429",
+        "gid": "0ef84bb2c611876f",
+        "status": "error",
+        "totalLength": "0"
+      }
+    }
+  },
+  {
+    "http_status": 500,
+    "reply": {
+      "id": "measure",
+      "jsonrpc": "2.0",
+      "result": {
+        "completedLength": "0",
+        "errorCode": "22",
+        "errorMessage": "The response status is not successful. status=500",
+        "gid": "25c2f18c5b82e5d2",
+        "status": "error",
+        "totalLength": "0"
+      }
+    }
+  },
+  {
+    "http_status": 502,
+    "reply": {
+      "id": "measure",
+      "jsonrpc": "2.0",
+      "result": {
+        "completedLength": "0",
+        "errorCode": "29",
+        "errorMessage": "The response status is not successful. status=502",
+        "gid": "fc294dd5f0662fd4",
+        "status": "error",
+        "totalLength": "0"
+      }
+    }
+  },
+  {
+    "http_status": 503,
+    "reply": {
+      "id": "measure",
+      "jsonrpc": "2.0",
+      "result": {
+        "completedLength": "0",
+        "errorCode": "29",
+        "errorMessage": "The response status is not successful. status=503",
+        "gid": "5cc0f0104d4104f5",
+        "status": "error",
+        "totalLength": "0"
+      }
+    }
+  },
+  {
+    "http_status": 504,
+    "reply": {
+      "id": "measure",
+      "jsonrpc": "2.0",
+      "result": {
+        "completedLength": "0",
+        "errorCode": "29",
+        "errorMessage": "The response status is not successful. status=504",
+        "gid": "32af9bad6fdfaa94",
+        "status": "error",
+        "totalLength": "0"
+      }
+    }
+  },
+  {
+    "http_status": 501,
+    "reply": {
+      "id": "measure",
+      "jsonrpc": "2.0",
+      "result": {
+        "completedLength": "0",
+        "errorCode": "22",
+        "errorMessage": "The response status is not successful. status=501",
+        "gid": "56f190aff280927b",
+        "status": "error",
+        "totalLength": "0"
+      }
+    }
+  },
+  {
+    "http_status": 505,
+    "reply": {
+      "id": "measure",
+      "jsonrpc": "2.0",
+      "result": {
+        "completedLength": "0",
+        "errorCode": "22",
+        "errorMessage": "The response status is not successful. status=505",
+        "gid": "c8b01d8d9cf735b6",
+        "status": "error",
+        "totalLength": "0"
+      }
+    }
+  }
+]

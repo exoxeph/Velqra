@@ -38,6 +38,16 @@ impl<S: Store> Core<S> {
             self.settle(engine, now)?;
         }
         self.start_waiting(engine, now, &mut events)?;
+        // No cache/pin retirement before persistence, including the terminal result of publish.
+        // Store is the reconciliation authority across adapter retirement and process restarts.
+        let live = self
+            .store
+            .all()?
+            .into_iter()
+            .filter(|r| matches!(r.state, TaskState::Committed | TaskState::Transferring))
+            .filter_map(|r| r.dispatch_attempt)
+            .collect::<Vec<_>>();
+        engine.retain_attempts(&live);
         Ok(events)
     }
 
@@ -48,25 +58,52 @@ impl<S: Store> Core<S> {
                 continue;
             };
             match rec.state {
-                TaskState::Committed if rec.engine_ambiguous && !rec.held => {
+                TaskState::Committed if rec.engine_ambiguous => {
                     // The last reply was lost. Establish what the engine holds before any new submit.
                     match engine.status(&attempt) {
                         Ok(EngineStatus::Active { .. } | EngineStatus::Paused) => {
+                            if rec.pending_pause.is_some() {
+                                // Preserve ambiguity and capacity until the engine confirms the pause.
+                                let confirmed =
+                                    matches!(engine.status(&attempt), Ok(EngineStatus::Paused))
+                                        || (engine.pause(&attempt).is_ok()
+                                            && matches!(
+                                                engine.status(&attempt),
+                                                Ok(EngineStatus::Paused)
+                                            ));
+                                if !confirmed {
+                                    self.store.put(&rec)?;
+                                    continue;
+                                }
+                                rec.paused = true;
+                                rec.pause_reason = rec.pending_pause.take();
+                            }
                             rec.engine_ambiguous = false;
+                            rec.held = false;
+                            rec.fail_reason = None;
                             set(&mut rec, TaskState::Transferring);
                         }
                         Ok(EngineStatus::Done) => {
                             rec.engine_ambiguous = false;
+                            rec.held = false;
+                            rec.fail_reason = None;
                             set(&mut rec, TaskState::Done);
                         }
                         Ok(EngineStatus::Failed(_)) => {
                             rec.engine_ambiguous = false;
+                            rec.held = false;
                             rec.fail_reason = Some("transfer failed".into());
                             set(&mut rec, TaskState::Failed);
                         }
                         Ok(EngineStatus::Interrupted) => {
                             rec.engine_ambiguous = false;
+                            rec.held = false;
+                            rec.fail_reason = None;
                             self.schedule_retry(&mut rec, now);
+                        }
+                        Ok(EngineStatus::Unknown) if rec.held => {
+                            // Proven absent: release capacity, but keep the explicit hold.
+                            rec.engine_ambiguous = false;
                         }
                         Ok(EngineStatus::Unknown) if rec.engine_resubmits < 1 => {
                             // proven absent: the start phase submits once more, same attempt id
@@ -74,11 +111,17 @@ impl<S: Store> Core<S> {
                             rec.engine_ambiguous = false;
                         }
                         Ok(EngineStatus::Unknown) | Err(_) => {
-                            rec.engine_queries += 1;
+                            rec.engine_queries = rec.engine_queries.saturating_add(1);
                             if rec.engine_queries >= MAX_STATUS_QUERIES {
                                 rec.held = true;
                                 rec.fail_reason = Some("engine identity unprovable".into());
                             }
+                        }
+                    }
+                    if !rec.engine_ambiguous && rec.state == TaskState::Committed {
+                        if let Some(reason) = rec.pending_pause.take() {
+                            rec.paused = true;
+                            rec.pause_reason = Some(reason);
                         }
                     }
                     self.store.put(&rec)?;
@@ -114,6 +157,12 @@ impl<S: Store> Core<S> {
         mut rec: Record,
         attempt: String,
     ) -> Result<(), StoreError> {
+        if rec.paused {
+            // Forgetting is definitive absence: restore a paused waiting record before any submit.
+            rec.engine_ambiguous = false;
+            set(&mut rec, TaskState::Committed);
+            return self.store.put(&rec);
+        }
         if rec.engine_redispatches >= MAX_REDISPATCHES {
             rec.fail_reason = Some("engine lost the task".into());
             set(&mut rec, TaskState::Failed);
@@ -194,7 +243,7 @@ impl<S: Store> Core<S> {
         let mut per_site: HashMap<String, u32> = HashMap::new();
         for r in &records {
             let running = r.state == TaskState::Transferring
-                || (r.state == TaskState::Committed && r.engine_ambiguous && !r.held);
+                || (r.state == TaskState::Committed && r.engine_ambiguous);
             if running {
                 active += 1;
                 if let Some(o) = self.origin_of(r) {
@@ -304,6 +353,10 @@ impl<S: Store> Core<S> {
         }
         let mut rec = self.queued_record(task_id)?;
         match rec.state {
+            TaskState::Committed if rec.engine_ambiguous => {
+                rec.pending_pause = Some(reason.to_string());
+                return self.store.put(&rec);
+            }
             TaskState::Committed => {}
             TaskState::Transferring => {
                 let attempt = rec.dispatch_attempt.clone().unwrap_or_default();
@@ -327,6 +380,7 @@ impl<S: Store> Core<S> {
                 .map_err(|_| StoreError::Io("the engine could not resume the task".into()))?;
         }
         rec.paused = false;
+        rec.pending_pause = None;
         rec.pause_reason = None;
         self.store.put(&rec)
     }

@@ -57,7 +57,9 @@ impl Env {
         let mut c = Command::new(exe);
         c.env("VELQRA_HOME", self.home())
             .env("VELQRA_PIPE", &self.suffix)
-            .env("VELQRA_APP", APP);
+            .env("VELQRA_APP", APP)
+            .env("VELQRA_ALLOW_LOOPBACK", "1")
+            .env_remove("VELQRA_ARIA2");
         c.env_remove("VELQRA_ALLOWED_ORIGINS");
         c
     }
@@ -102,8 +104,13 @@ impl Env {
 
     fn kill_core_quiet(&self) {
         if let Some(pid) = self.app_pid() {
-            let _ = Command::new("taskkill")
-                .args(["/F", "/PID", &pid.to_string()])
+            let _ = Command::new("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    &format!("Stop-Process -Id {pid} -Force -ErrorAction SilentlyContinue"),
+                ])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
@@ -170,11 +177,11 @@ impl Env {
 impl Drop for Env {
     fn drop(&mut self) {
         // cleanup must never panic: a panic while a test is already unwinding aborts the whole run
-        self.kill_core_quiet();
         for k in &mut self.kids {
             let _ = k.kill();
             let _ = k.wait();
         }
+        self.kill_core_quiet();
     }
 }
 
@@ -652,6 +659,7 @@ fn a_client_cannot_write_settings_by_sending_a_reply_type() {
     env.start_app("app.err");
     let mut c = ready_client(&mut env, 1, "host.err");
     let forged = SettingsSnapshot {
+        transfer_capable: true,
         mode: CaptureMode::Off,
         extensions: vec!["pdf".into()],
         excluded_sites: vec![],
@@ -686,14 +694,17 @@ fn aria2_exe() -> Option<PathBuf> {
 }
 
 fn aria2_process_count() -> usize {
-    let out = Command::new("tasklist")
-        .args(["/FI", "IMAGENAME eq aria2c.exe", "/NH"])
+    let out = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "@(Get-Process aria2c -ErrorAction SilentlyContinue).Count",
+        ])
         .output()
         .unwrap();
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter(|l| l.to_ascii_lowercase().contains("aria2c.exe"))
-        .count()
+    assert!(out.status.success(), "process count unavailable");
+    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
 }
 
 #[test]

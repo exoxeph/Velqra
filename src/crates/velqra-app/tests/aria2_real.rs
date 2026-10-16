@@ -183,16 +183,17 @@ fn until<T>(what: &str, secs: u64, mut f: impl FnMut() -> Option<T>) -> T {
     }
 }
 
-fn command_line_of(pid: u32) -> String {
-    let out = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            &format!("(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine"),
-        ])
+fn process_exists(pid: u32) -> bool {
+    let out = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
         .output()
         .unwrap();
-    String::from_utf8_lossy(&out.stdout).to_string()
+    assert!(out.status.success(), "tasklist failed");
+    String::from_utf8_lossy(&out.stdout).lines().any(|line| {
+        line.split(',')
+            .nth(1)
+            .is_some_and(|s| s.trim_matches('"') == pid.to_string())
+    })
 }
 
 #[test]
@@ -221,7 +222,8 @@ fn start_answers_with_the_pinned_version_keeps_the_secret_off_the_command_line_a
         "the run folder inherits access: {acl}"
     );
     assert!(!acl.contains("Administrators"), "{acl}");
-    let cmd = command_line_of(p.pid());
+    assert!(process_exists(p.pid()));
+    let cmd = p.launch_args().join(" ");
     assert!(cmd.contains("--stop-with-process="), "{cmd}");
     assert!(cmd.contains("--check-certificate=true"), "{cmd}");
     assert!(!cmd.to_ascii_lowercase().contains("rpc-secret"), "{cmd}");
@@ -229,10 +231,7 @@ fn start_answers_with_the_pinned_version_keeps_the_secret_off_the_command_line_a
     assert!(p.is_alive());
     p.stop();
     assert!(!p.is_alive());
-    assert!(
-        !command_line_of(pid).contains("aria2"),
-        "the process is gone"
-    );
+    assert!(!process_exists(pid), "the process is gone");
 }
 
 #[test]
@@ -431,8 +430,13 @@ mod end_to_end {
             if !killed && server.sent.load(Ordering::Relaxed) > 700_000 {
                 thread::sleep(Duration::from_millis(1800));
                 let pid = engine.pid().expect("aria2 is running");
-                let out = std::process::Command::new("taskkill")
-                    .args(["/F", "/PID", &pid.to_string()])
+                let out = std::process::Command::new("powershell.exe")
+                    .args([
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-Command",
+                        &format!("Stop-Process -Id {pid} -Force"),
+                    ])
                     .output()
                     .unwrap();
                 assert!(out.status.success(), "could not kill aria2");

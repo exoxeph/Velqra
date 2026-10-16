@@ -19,6 +19,37 @@ use velqra_protocol::*;
 
 static N: AtomicU32 = AtomicU32::new(0);
 
+#[test]
+fn missing_engine_is_visible_and_prepare_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let pipe = unique_pipe();
+    let mut config = cfg(dir.path(), &pipe);
+    config.allow_loopback = false;
+    let rt = Runtime::start(config).unwrap();
+    let mut c = session(&pipe, &secret_of(dir.path()), 19);
+    let health = c
+        .request("h", "no-engine", Message::Health(Empty {}))
+        .unwrap();
+    let json = serde_json::to_value(&health).unwrap();
+    assert_eq!(json["body"]["payload"]["transfer_capable"], false);
+    assert!(json["body"]["payload"]["problem"].is_string());
+    let settings = c
+        .request("s", "no-engine", Message::SettingsGet(Empty {}))
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(settings).unwrap()["body"]["payload"]["transfer_capable"],
+        false
+    );
+    assert!(matches!(
+        c.request("p", "no-engine", Message::Prepare(prepare_body()))
+            .unwrap()
+            .body,
+        Message::Error(_)
+    ));
+    assert!(records(dir.path()).is_empty());
+    rt.stop();
+}
+
 fn unique_pipe() -> String {
     velqra_ipc::pipe_name(&format!(
         "rt-{}-{}",
@@ -35,6 +66,7 @@ fn cfg(home: &Path, pipe: &str) -> RuntimeConfig {
         allowed: vec![ORIGIN.to_string()],
         download_root: home.join("downloads"),
         aria2: None,
+        allow_loopback: true,
         tick_ms: 5,
     }
 }

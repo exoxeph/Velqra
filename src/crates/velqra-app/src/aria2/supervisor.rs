@@ -60,6 +60,22 @@ impl Aria2Supervisor {
         Some(Aria2Engine::new(client, self.cfg))
     }
 
+    pub fn ready(&mut self) -> bool {
+        if self.engine().is_none() {
+            return false;
+        }
+        let responsive = self.live.as_ref().is_some_and(|p| {
+            p.client(self.timeout)
+                .call("aria2.getVersion", vec![])
+                .is_ok_and(|v| v["version"] == super::process::PINNED_ARIA2_VERSION)
+        });
+        if !responsive {
+            self.stop();
+            self.retry_after = Some(Instant::now() + RETRY_AFTER_FAILURE);
+        }
+        responsive
+    }
+
     /// The running process id, if any (diagnostics and tests).
     pub fn pid(&mut self) -> Option<u32> {
         let p = self.live.as_mut()?;
@@ -74,6 +90,9 @@ impl Aria2Supervisor {
 }
 
 impl Engine for Aria2Supervisor {
+    fn readiness(&mut self) -> Option<bool> {
+        Some(self.ready())
+    }
     fn submit(&mut self, request: &EngineRequest) -> Result<(), EngineError> {
         match self.engine() {
             Some(mut e) => e.submit(request),
@@ -134,6 +153,116 @@ impl Drop for Aria2Supervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capability_tracks_restart_failure_and_recovery_at_admission() {
+        use velqra_bridge::backend::{Backend, CoreBackend};
+        use velqra_core::{store::MemStore, Core};
+        use velqra_protocol::*;
+        let d = tempfile::tempdir().unwrap();
+        let exe = d.path().join("aria2c.exe");
+        let vendor = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../vendor/aria2/1.37.0/aria2c.exe");
+        std::fs::copy(&vendor, &exe).unwrap();
+        let launch = Launch {
+            exe: exe.clone(),
+            expected_sha256: super::super::process::PINNED_ARIA2_SHA256.into(),
+            run_dir: d.path().join("run"),
+            max_concurrent: 1,
+            parent_pid: std::process::id(),
+            ready_timeout: Duration::from_secs(5),
+        };
+        let mut s = Aria2Supervisor::new(launch, Aria2Config::default());
+        assert!(s.ready());
+        let mut b = CoreBackend::new(Core::new(MemStore::default()), s, "aria2");
+        assert!(b.transfer_capable());
+        let envelope = |rid: &str, body| Envelope {
+            version: PROTOCOL_VERSION,
+            message_id: format!("m-{rid}"),
+            session_id: "s".into(),
+            request_id: rid.into(),
+            generation: 1,
+            body,
+        };
+        let prep = || {
+            Message::Prepare(PrepareBody {
+                download_key: "k".into(),
+                url: "https://x.test/a".into(),
+                filename: "a.bin".into(),
+                context: Secret("c".into()),
+            })
+        };
+        let prepared = b.handle(&envelope("old", prep()), 1);
+        let Message::Prepared(receipt) = prepared.body else {
+            panic!("prepare failed")
+        };
+        assert!(matches!(
+            b.handle(&envelope("old", Message::BeginHandoff(receipt.as_ref())), 1)
+                .body,
+            Message::Armed(_)
+        ));
+        let Message::Prepared(owned) = b.handle(&envelope("owned", prep()), 1).body else {
+            panic!("prepare owned failed")
+        };
+        b.handle(&envelope("owned", Message::BeginHandoff(owned.as_ref())), 1);
+        assert!(matches!(
+            b.handle(
+                &envelope(
+                    "owned",
+                    Message::Commit(CommitBody {
+                        receipt: owned.as_ref(),
+                        cancel: CancelEvidence::Confirmed
+                    })
+                ),
+                1
+            )
+            .body,
+            Message::Committed(_)
+        ));
+        b.engine.stop();
+        std::fs::write(&exe, b"invalid executable").unwrap();
+        assert!(
+            !b.transfer_capable(),
+            "health must lose capability after persistent restart failure"
+        );
+        assert!(b.problem().is_some());
+        assert!(
+            matches!(b.handle(&envelope("owned", Message::Status(Empty {})), 2).body,
+            Message::StatusReply(ref r) if r.state == TaskState::Committed),
+            "lost readiness must preserve committed ownership"
+        );
+        assert!(matches!(
+            b.handle(&envelope("new", prep()), 2).body,
+            Message::Error(_)
+        ));
+        assert!(matches!(
+            b.handle(&envelope("old", Message::BeginHandoff(receipt.as_ref())), 3)
+                .body,
+            Message::Error(_)
+        ));
+        assert!(
+            matches!(
+                b.handle(&envelope("old", Message::Status(Empty {})), 3)
+                    .body,
+                Message::Error(_)
+            ),
+            "Armed status must refuse final handoff admission when engine is lost"
+        );
+        let settings = b.handle(&envelope("settings", Message::SettingsGet(Empty {})), 4);
+        assert!(
+            matches!(settings.body, Message::SettingsReply(ref s) if !s.transfer_capable && s.problem.is_some())
+        );
+        // Backoff does not erase failure; a later retry with restored bytes recovers readiness.
+        assert!(!b.transfer_capable());
+        std::fs::copy(vendor, &exe).unwrap();
+        b.engine.retry_after = None;
+        assert!(b.transfer_capable());
+        assert!(b.problem().is_none());
+        assert!(matches!(
+            b.handle(&envelope("new", prep()), 5).body,
+            Message::Prepared(_)
+        ));
+    }
 
     #[test]
     fn a_launch_that_cannot_start_answers_could_not_ask_and_backs_off() {

@@ -125,3 +125,67 @@ fn probe_folder_swap_race() {
     );
     println!("PROBE files that landed outside the root: {leaked:?}");
 }
+
+/// A deterministic regression on REAL aria2: the lease spans its asynchronous path-based open,
+/// status observation, and the later durable-terminal acknowledgement.
+#[test]
+fn real_aria2_directory_lease_survives_until_terminal_ack() {
+    let exe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../vendor/aria2/1.37.0/aria2c.exe");
+    assert!(
+        exe.exists(),
+        "pinned build required for containment regression"
+    );
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("dl");
+    std::fs::create_dir(&root).unwrap();
+    let outside = d.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    let data = Arc::new(payload(30_000, 29));
+    let dd = data.clone();
+    let server = serve(move |r| ranged(&dd, r, None).slow(30_000));
+    let sup = Aria2Supervisor::new(
+        Launch {
+            exe,
+            expected_sha256: PINNED_ARIA2_SHA256.into(),
+            run_dir: d.path().join("run"),
+            max_concurrent: 1,
+            parent_pid: std::process::id(),
+            ready_timeout: Duration::from_secs(15),
+        },
+        Aria2Config::default(),
+    );
+    let mut engine = Guarded::new(sup, root.clone());
+    let cat = root.join("Other");
+    let dest = cat.join("file.bin");
+    let req = EngineRequest {
+        attempt: "lease-g1".into(),
+        url: server.url("/file.bin"),
+        filename: "file.bin".into(),
+        context_ref: None,
+        destination: Some(dest.to_string_lossy().into_owned()),
+        context: None,
+    };
+    engine.submit(&req).unwrap();
+    assert!(std::fs::rename(&cat, root.join("moved")).is_err());
+    assert!(std::fs::rename(&root, d.path().join("moved-root")).is_err());
+    let until = Instant::now() + Duration::from_secs(15);
+    loop {
+        let status = engine.status(&req.attempt).unwrap();
+        if status == EngineStatus::Done {
+            break;
+        }
+        assert!(matches!(status, EngineStatus::Active { .. }));
+        assert!(Instant::now() < until);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(std::fs::read(&dest).unwrap(), *data);
+    assert!(
+        std::fs::rename(&cat, root.join("moved")).is_err(),
+        "terminal not yet acknowledged"
+    );
+    engine.retain_attempts(&[]);
+    assert_eq!(engine.status(&req.attempt), Ok(EngineStatus::Unknown));
+    std::fs::rename(&cat, root.join("moved")).unwrap();
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+}

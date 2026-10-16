@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Protection around the engine's first write and its final result (review 26b gate for Group C).
 //!
-//! Prepare checked the destination long before aria2 writes to it, and a path check followed by a
-//! path-based write can always lose a race to a folder that is swapped for a junction in between.
-//! aria2 writes by path, so the race cannot be closed from here; what this guard does is shrink and
-//! then surface it: the folder is created by us immediately before the submit (a folder we just made
-//! cannot already be a link), the destination is re-checked for links, and once the engine reports
-//! the file exists or is complete the real location is checked again. A violation cancels the task
-//! and is reported as a failed transfer, never as success.
+//! Directory leases deny rename/delete on every ancestor while aria2 uses path-based opens.
+//! Publication pins the source file and renames that object by handle without replacement.
+//! This prevents directory substitution; it does not prevent same-user in-place content changes.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -21,6 +17,7 @@ const PART_SUFFIX: &str = ".velqra-part";
 struct Paths {
     final_path: PathBuf,
     part: PathBuf,
+    lease: velqra_ipc::DirectoryLease,
 }
 
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -102,8 +99,8 @@ fn looks_like_html(path: &Path) -> bool {
 }
 
 /// Moves `part` and its aria2 control file to `<part>.stale-N` names that are not in use, without
-/// ever replacing anything (a hard link fails when the name exists).
-fn isolate_stale(part: &Path) -> std::io::Result<()> {
+/// ever replacing anything (the handle rename fails when the name exists).
+fn isolate_stale(part: &Path, lease: &velqra_ipc::DirectoryLease) -> std::io::Result<()> {
     let control = with_suffix(part, ".aria2");
     let part_there = std::fs::symlink_metadata(part).is_ok();
     let control_there = std::fs::symlink_metadata(&control).is_ok();
@@ -119,12 +116,10 @@ fn isolate_stale(part: &Path) -> std::io::Result<()> {
             continue;
         }
         if part_there {
-            std::fs::hard_link(part, &stale)?;
-            std::fs::remove_file(part)?;
+            lease.publish(part, &stale)?;
         }
         if control_there {
-            std::fs::hard_link(&control, &stale_control)?;
-            std::fs::remove_file(&control)?;
+            lease.publish(&control, &stale_control)?;
         }
         return Ok(());
     }
@@ -136,10 +131,13 @@ pub struct Guarded<E: Engine> {
     root: PathBuf,
     destinations: HashMap<String, Paths>,
     violated: HashSet<String>,
+    stopping: HashSet<String>,
     published: HashSet<String>,
     /// Test-only: runs between the last check and the publish, to model a folder swapped there.
     #[cfg(test)]
     before_publish: Option<Box<dyn FnMut()>>,
+    #[cfg(test)]
+    before_submit: Option<Box<dyn FnMut()>>,
 }
 
 impl<E: Engine> Guarded<E> {
@@ -149,9 +147,12 @@ impl<E: Engine> Guarded<E> {
             root,
             destinations: HashMap::new(),
             violated: HashSet::new(),
+            stopping: HashSet::new(),
             published: HashSet::new(),
             #[cfg(test)]
             before_publish: None,
+            #[cfg(test)]
+            before_submit: None,
         }
     }
 
@@ -174,7 +175,7 @@ impl<E: Engine> Guarded<E> {
             .map(|p| (p.final_path.clone(), p.part.clone()))?;
         if !self.still_inside(&part) {
             self.violation(attempt);
-            return Some(EngineStatus::Failed("transfer failed".into()));
+            return None;
         }
         if !done {
             return None;
@@ -184,22 +185,18 @@ impl<E: Engine> Guarded<E> {
             self.violated.insert(attempt.to_string());
             return Some(EngineStatus::Failed("transfer failed".into()));
         }
-        // Publish: a hard link fails if the final name exists, so a file that appeared meanwhile is
-        // never replaced; only then is the part name dropped.
+        // Publish by a no-replace handle rename: failure leaves only the part name.
         #[cfg(test)]
         if let Some(hook) = self.before_publish.as_mut() {
             hook();
         }
-        match std::fs::hard_link(&part, &final_path) {
+        match self
+            .destinations
+            .get(attempt)?
+            .lease
+            .publish(&part, &final_path)
+        {
             Ok(()) => {
-                // The link was made by path, so look again: only a final name that is still a plain
-                // place under the root counts. Nothing is removed unless it is, because the part
-                // name may by now lead somewhere that is not ours.
-                if !self.still_inside(&final_path) {
-                    self.violated.insert(attempt.to_string());
-                    return Some(EngineStatus::Failed("transfer failed".into()));
-                }
-                let _ = std::fs::remove_file(&part);
                 self.published.insert(attempt.to_string());
                 Some(EngineStatus::Done)
             }
@@ -213,12 +210,50 @@ impl<E: Engine> Guarded<E> {
 
     fn violation(&mut self, attempt: &str) {
         if self.violated.insert(attempt.to_string()) {
+            self.stopping.insert(attempt.to_string());
             let _ = self.inner.cancel(attempt);
         }
+    }
+    // A cancel reply alone is not proof: query until the writer is definitively absent/stopped.
+    fn settle_violation(&mut self, attempt: &str) -> Result<EngineStatus, EngineError> {
+        if self.stopping.contains(attempt) {
+            let _ = self.inner.cancel(attempt);
+            match self.inner.status(attempt) {
+                Ok(
+                    EngineStatus::Unknown
+                    | EngineStatus::Done
+                    | EngineStatus::Failed(_)
+                    | EngineStatus::Interrupted,
+                ) => {
+                    self.stopping.remove(attempt);
+                }
+                _ => return Err(EngineError::ReplyLost),
+            }
+        }
+        Ok(EngineStatus::Failed("transfer failed".into()))
     }
 }
 
 impl<E: Engine> Engine for Guarded<E> {
+    fn readiness(&mut self) -> Option<bool> {
+        self.inner.readiness()
+    }
+    fn retain_attempts(&mut self, live: &[String]) {
+        let live: HashSet<&str> = live.iter().map(String::as_str).collect();
+        self.destinations
+            .retain(|id, _| live.contains(id.as_str()) || self.stopping.contains(id));
+        self.violated
+            .retain(|id| live.contains(id.as_str()) || self.stopping.contains(id));
+        self.published.retain(|id| live.contains(id.as_str()));
+        self.inner.retain_attempts(
+            &live
+                .into_iter()
+                .map(str::to_owned)
+                .chain(self.stopping.iter().cloned())
+                .collect::<Vec<_>>(),
+        );
+    }
+
     fn submit(&mut self, request: &EngineRequest) -> Result<(), EngineError> {
         let Some(dest) = request.destination.as_deref().map(PathBuf::from) else {
             return Err(EngineError::Rejected);
@@ -230,9 +265,8 @@ impl<E: Engine> Engine for Guarded<E> {
         if !self.still_inside(&dest) {
             return Err(EngineError::Rejected);
         }
-        // we make the folder ourselves right now, then look again: a folder created a moment ago
-        // by this process cannot already have been a link, and an existing one is checked as it is
-        std::fs::create_dir_all(parent).map_err(|_| EngineError::Rejected)?;
+        let lease = velqra_ipc::DirectoryLease::acquire(&self.root, parent)
+            .map_err(|_| EngineError::Rejected)?;
         if !self.still_inside(&dest) {
             return Err(EngineError::Rejected);
         }
@@ -248,7 +282,7 @@ impl<E: Engine> Engine for Guarded<E> {
         // Only when the engine positively does not know the task: a task it is running right now owns
         // its part file, and a question it cannot answer is no licence to move anything.
         if self.inner.status(&request.attempt) == Ok(EngineStatus::Unknown) {
-            isolate_stale(&part).map_err(|_| EngineError::Rejected)?;
+            isolate_stale(&part, &lease).map_err(|_| EngineError::Rejected)?;
         }
         let mut forwarded = request.clone();
         forwarded.destination = Some(part.to_string_lossy().into_owned());
@@ -257,8 +291,13 @@ impl<E: Engine> Engine for Guarded<E> {
             Paths {
                 final_path: dest,
                 part,
+                lease,
             },
         );
+        #[cfg(test)]
+        if let Some(hook) = self.before_submit.as_mut() {
+            hook();
+        }
         self.inner.submit(&forwarded)
     }
 
@@ -271,8 +310,11 @@ impl<E: Engine> Engine for Guarded<E> {
     }
 
     fn status(&mut self, attempt: &str) -> Result<EngineStatus, EngineError> {
+        if !self.destinations.contains_key(attempt) {
+            return Ok(EngineStatus::Unknown);
+        }
         if self.violated.contains(attempt) {
-            return Ok(EngineStatus::Failed("transfer failed".into()));
+            return self.settle_violation(attempt);
         }
         if self.published.contains(attempt) {
             return Ok(EngineStatus::Done);
@@ -283,12 +325,21 @@ impl<E: Engine> Engine for Guarded<E> {
                 return Ok(settled);
             }
         }
+        if self.stopping.contains(attempt) {
+            return self.settle_violation(attempt);
+        }
         Ok(status)
     }
 
     fn poll(&mut self, attempt: &str) -> Poll {
+        if !self.destinations.contains_key(attempt) {
+            return Poll::Forgotten;
+        }
         if self.violated.contains(attempt) {
-            return Poll::Failed;
+            return match self.settle_violation(attempt) {
+                Ok(_) => Poll::Failed,
+                Err(_) => Poll::Unreachable,
+            };
         }
         if self.published.contains(attempt) {
             return Poll::Done;
@@ -296,10 +347,12 @@ impl<E: Engine> Engine for Guarded<E> {
         match self.inner.poll(attempt) {
             Poll::Running => match self.check(attempt, false) {
                 Some(_) => Poll::Failed,
+                None if self.stopping.contains(attempt) => Poll::Unreachable,
                 None => Poll::Running,
             },
             Poll::Done => match self.check(attempt, true) {
                 Some(EngineStatus::Failed(_)) => Poll::Failed,
+                _ if self.stopping.contains(attempt) => Poll::Unreachable,
                 _ => Poll::Done,
             },
             other => other,
@@ -307,7 +360,7 @@ impl<E: Engine> Engine for Guarded<E> {
     }
 
     fn has_forgotten(&mut self, attempt: &str) -> bool {
-        self.inner.has_forgotten(attempt)
+        !self.destinations.contains_key(attempt) || self.inner.has_forgotten(attempt)
     }
 
     fn pause(&mut self, attempt: &str) -> Result<(), EngineError> {
@@ -334,6 +387,7 @@ mod tests {
     struct Probe {
         log: Rc<RefCell<Vec<String>>>,
         state: Rc<RefCell<Option<EngineStatus>>>,
+        cancel_error: Rc<RefCell<Option<EngineError>>>,
     }
 
     impl Engine for Probe {
@@ -357,6 +411,10 @@ mod tests {
         }
         fn cancel(&mut self, a: &str) -> Result<(), EngineError> {
             self.log.borrow_mut().push(format!("cancel {a}"));
+            if let Some(e) = *self.cancel_error.borrow() {
+                return Err(e);
+            }
+            *self.state.borrow_mut() = Some(EngineStatus::Unknown);
             Ok(())
         }
     }
@@ -386,6 +444,213 @@ mod tests {
             .output()
             .unwrap();
         assert!(out.status.success());
+    }
+
+    #[test]
+    fn violation_keeps_pins_until_failed_or_lost_cancel_is_proven_stopped() {
+        for error in [EngineError::Rejected, EngineError::ReplyLost] {
+            let d = tempfile::tempdir().unwrap();
+            let probe = Probe::default();
+            *probe.cancel_error.borrow_mut() = Some(error);
+            let mut g = Guarded::new(probe.clone(), d.path().to_path_buf());
+            let dest = d.path().join("Other").join("a.bin");
+            g.submit(&request(&dest)).unwrap();
+            // Replacing the part by a junction is a real containment violation.
+            std::fs::remove_file(part_of(&dest)).unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            junction(&part_of(&dest), outside.path());
+            assert_eq!(g.poll("t1-g1"), Poll::Unreachable);
+            assert_eq!(g.status("t1-g1"), Err(EngineError::ReplyLost));
+            // Explicit early durable failure is not proof of engine stop.
+            use velqra_core::store::{Record, SqliteStore, Store};
+            use velqra_protocol::TaskState;
+            let mut store = SqliteStore::open(&d.path().join("failed.db")).unwrap();
+            let failed = Record::new(1, "failed", 1, "fp", TaskState::Failed);
+            store.insert(&failed).unwrap();
+            assert_eq!(
+                store.get_by_task(1).unwrap().unwrap().state,
+                TaskState::Failed
+            );
+            g.retain_attempts(&[]);
+            assert_eq!(g.destinations.len(), 1);
+            assert!(std::fs::rename(dest.parent().unwrap(), d.path().join("moved")).is_err());
+            if error == EngineError::ReplyLost {
+                // The cancel took effect, but its reply remains lost: absence is enough proof.
+                *probe.state.borrow_mut() = Some(EngineStatus::Unknown);
+            } else {
+                *probe.cancel_error.borrow_mut() = None;
+            }
+            assert_eq!(g.poll("t1-g1"), Poll::Failed);
+            g.retain_attempts(&[]);
+            assert!(g.destinations.is_empty());
+            assert!(!dest.exists());
+            std::fs::remove_dir(part_of(&dest)).unwrap();
+        }
+    }
+
+    #[test]
+    fn containment_stop_ambiguity_keeps_queue_capacity_until_stop() {
+        use velqra_core::{
+            destination::DestinationPolicy,
+            store::{MemStore, Store},
+            Core,
+        };
+        use velqra_protocol::*;
+        let d = tempfile::tempdir().unwrap();
+        let probe = Probe::default();
+        *probe.cancel_error.borrow_mut() = Some(EngineError::ReplyLost);
+        let mut g = Guarded::new(probe.clone(), d.path().to_path_buf());
+        let mut core = Core::new(MemStore::default())
+            .with_limits(1, 1)
+            .with_destination(DestinationPolicy::new(d.path().to_path_buf()));
+        for n in 1..=2 {
+            let rid = format!("r{n}");
+            let env = |body| Envelope {
+                version: PROTOCOL_VERSION,
+                message_id: format!("m{n}"),
+                session_id: "s".into(),
+                request_id: rid.clone(),
+                generation: 1,
+                body,
+            };
+            let reply = core.handle(
+                &env(Message::Prepare(PrepareBody {
+                    download_key: format!("k{n}"),
+                    url: format!("https://x.test/{n}"),
+                    filename: format!("{n}.bin"),
+                    context: Secret("c".into()),
+                })),
+                1,
+            );
+            let Message::Prepared(r) = reply.body else {
+                panic!("prepare failed")
+            };
+            core.handle(&env(Message::BeginHandoff(r.as_ref())), 2);
+            core.handle(
+                &env(Message::Commit(CommitBody {
+                    receipt: r.as_ref(),
+                    cancel: CancelEvidence::Confirmed,
+                })),
+                3,
+            );
+        }
+        core.pump_at(&mut g, 10).unwrap();
+        let dest = d.path().join("Other").join("1.bin");
+        std::fs::remove_file(part_of(&dest)).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        junction(&part_of(&dest), outside.path());
+        for t in 11..15 {
+            core.pump_at(&mut g, t).unwrap();
+        }
+        assert_eq!(
+            core.store.get_by_task(1).unwrap().unwrap().state,
+            TaskState::Transferring
+        );
+        assert_eq!(
+            probe
+                .log
+                .borrow()
+                .iter()
+                .filter(|s| s.starts_with("submit"))
+                .count(),
+            1
+        );
+        assert_eq!(g.destinations.len(), 1);
+        *probe.cancel_error.borrow_mut() = None;
+        core.pump_at(&mut g, 15).unwrap();
+        assert_eq!(
+            core.store.get_by_task(1).unwrap().unwrap().state,
+            TaskState::Failed
+        );
+        assert_eq!(
+            probe
+                .log
+                .borrow()
+                .iter()
+                .filter(|s| s.starts_with("submit"))
+                .count(),
+            2
+        );
+        assert!(!g.destinations.contains_key("t1-g1"));
+        std::fs::remove_dir(part_of(&dest)).unwrap();
+    }
+
+    #[test]
+    fn swap_between_last_submit_check_and_engine_open_cannot_redirect_the_write() {
+        let d = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let cat = d.path().join("Other");
+        let moved = d.path().join("moved");
+        let out = outside.path().to_path_buf();
+        let probe = Probe::default();
+        let mut g = Guarded::new(probe, d.path().to_path_buf());
+        g.before_submit = Some(Box::new(move || {
+            // Actual attempted swap at the original check-to-open boundary.
+            if std::fs::rename(&cat, &moved).is_ok() {
+                junction(&cat, &out);
+            }
+        }));
+        let dest = d.path().join("Other").join("a.bin");
+        g.submit(&request(&dest)).unwrap();
+        assert!(part_of(&dest).exists());
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn terminal_persist_ack_retires_all_guard_maps_and_late_poll_cannot_publish() {
+        let d = tempfile::tempdir().unwrap();
+        let probe = Probe::default();
+        let mut g = Guarded::new(probe.clone(), d.path().to_path_buf());
+        for n in 0..500 {
+            let dest = d.path().join("Other").join(format!("{n}.bin"));
+            let mut r = request(&dest);
+            r.attempt = format!("t{n}-g1");
+            g.submit(&r).unwrap();
+            *probe.state.borrow_mut() = Some(EngineStatus::Done);
+            assert_eq!(g.status(&r.attempt), Ok(EngineStatus::Done));
+            assert_eq!(
+                g.destinations.len(),
+                1,
+                "pins survive until persistence ack"
+            );
+            g.retain_attempts(&[]);
+            assert!(g.destinations.is_empty() && g.violated.is_empty() && g.published.is_empty());
+            std::fs::remove_file(&dest).unwrap();
+            std::fs::write(part_of(&dest), b"decoy").unwrap();
+            assert_eq!(g.poll(&r.attempt), Poll::Forgotten);
+            assert_eq!(g.status(&r.attempt), Ok(EngineStatus::Unknown));
+            assert!(!dest.exists(), "late reply must not republish");
+            std::fs::remove_file(part_of(&dest)).unwrap();
+        }
+        // Failed attempts release the same metadata.
+        let dest = d.path().join("Other").join("failed.bin");
+        g.submit(&request(&dest)).unwrap();
+        std::fs::write(&dest, b"theirs").unwrap();
+        *probe.state.borrow_mut() = Some(EngineStatus::Done);
+        assert!(matches!(g.status("t1-g1"), Ok(EngineStatus::Failed(_))));
+        g.retain_attempts(&[]);
+        assert!(g.destinations.is_empty() && g.violated.is_empty() && g.published.is_empty());
+    }
+
+    #[test]
+    fn directory_pins_block_real_swaps_at_submit_and_publish_until_retired() {
+        let d = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let probe = Probe::default();
+        let mut g = Guarded::new(probe.clone(), d.path().to_path_buf());
+        let dest = d.path().join("Other").join("a.bin");
+        g.submit(&request(&dest)).unwrap();
+        assert!(std::fs::rename(dest.parent().unwrap(), d.path().join("moved")).is_err());
+        assert!(std::fs::rename(d.path(), d.path().with_extension("moved")).is_err());
+        let cat = dest.parent().unwrap().to_path_buf();
+        let moved = d.path().join("moved");
+        g.before_publish = Some(Box::new(move || {
+            assert!(std::fs::rename(&cat, &moved).is_err());
+        }));
+        *probe.state.borrow_mut() = Some(EngineStatus::Done);
+        assert_eq!(g.status("t1-g1"), Ok(EngineStatus::Done));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"payload");
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
     }
 
     #[test]
@@ -468,59 +733,18 @@ mod tests {
     }
 
     #[test]
-    fn a_folder_swapped_for_a_junction_after_the_submit_is_caught_and_the_task_is_cancelled_once() {
+    fn a_folder_swap_after_submit_is_prevented_before_any_outside_write() {
         let d = tempfile::tempdir().unwrap();
-        let elsewhere = tempfile::tempdir().unwrap();
-        let probe = Probe::default();
-        let mut g = Guarded::new(probe.clone(), d.path().to_path_buf());
-        let dest = d.path().join("Compressed").join("a.zip");
-        g.submit(&request(&dest)).unwrap();
-        // the engine's first write lands after this swap: model it by swapping, then writing outside
-        std::fs::remove_file(part_of(&dest)).unwrap();
-        std::fs::remove_dir(d.path().join("Compressed")).unwrap();
-        junction(&d.path().join("Compressed"), elsewhere.path());
-        std::fs::write(elsewhere.path().join("a.zip.velqra-part"), b"escaped").unwrap();
-        for _ in 0..3 {
-            assert_eq!(
-                g.status("t1-g1"),
-                Ok(EngineStatus::Failed("transfer failed".into()))
-            );
-        }
-        assert_eq!(g.finished("t1-g1"), Some(false));
-        // putting the folder back must not turn the verdict into success later
-        std::fs::remove_dir(d.path().join("Compressed")).unwrap();
-        std::fs::create_dir(d.path().join("Compressed")).unwrap();
-        *probe.state.borrow_mut() = Some(EngineStatus::Done);
-        assert_eq!(
-            g.status("t1-g1"),
-            Ok(EngineStatus::Failed("transfer failed".into()))
-        );
-        let cancels = probe
-            .log
-            .borrow()
-            .iter()
-            .filter(|l| l.starts_with("cancel"))
-            .count();
-        assert_eq!(cancels, 1, "cancelled exactly once, not on every poll");
-    }
-
-    #[test]
-    fn a_task_that_finished_in_the_wrong_place_is_never_reported_as_done() {
-        let d = tempfile::tempdir().unwrap();
-        let elsewhere = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
         let probe = Probe::default();
         let mut g = Guarded::new(probe.clone(), d.path().to_path_buf());
         let dest = d.path().join("Other").join("a.bin");
         g.submit(&request(&dest)).unwrap();
-        std::fs::remove_file(part_of(&dest)).unwrap();
-        std::fs::remove_dir(d.path().join("Other")).unwrap();
-        junction(&d.path().join("Other"), elsewhere.path());
+        assert!(std::fs::rename(dest.parent().unwrap(), d.path().join("moved")).is_err());
+        assert!(std::fs::remove_dir(dest.parent().unwrap()).is_err());
         *probe.state.borrow_mut() = Some(EngineStatus::Done);
-        assert_eq!(
-            g.status("t1-g1"),
-            Ok(EngineStatus::Failed("transfer failed".into()))
-        );
-        assert_eq!(g.finished("t1-g1"), Some(false));
+        assert_eq!(g.status("t1-g1"), Ok(EngineStatus::Done));
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
     }
 
     #[test]
@@ -806,25 +1030,6 @@ mod tests {
         };
         assert_eq!(st, Poll::Failed);
         assert!(!dest.exists());
-        // a folder swapped for a junction while the task runs
-        let d = tempfile::tempdir().unwrap();
-        let elsewhere = tempfile::tempdir().unwrap();
-        let probe = Probe::default();
-        let mut g = Guarded::new(probe.clone(), d.path().to_path_buf());
-        let dest = d.path().join("Other").join("a.bin");
-        g.submit(&request(&dest)).unwrap();
-        std::fs::remove_file(part_of(&dest)).unwrap();
-        std::fs::remove_dir(d.path().join("Other")).unwrap();
-        junction(&d.path().join("Other"), elsewhere.path());
-        assert_eq!(g.poll("t1-g1"), Poll::Failed);
-        assert_eq!(g.poll("t1-g1"), Poll::Failed);
-        let cancels = probe
-            .log
-            .borrow()
-            .iter()
-            .filter(|l| l.starts_with("cancel"))
-            .count();
-        assert_eq!(cancels, 1);
         // the final name taken meanwhile
         let d = tempfile::tempdir().unwrap();
         let probe = Probe::default();
@@ -838,32 +1043,23 @@ mod tests {
     }
 
     #[test]
-    fn a_folder_swapped_between_the_last_check_and_the_publish_is_never_reported_as_done() {
+    fn a_swap_at_publication_cannot_redirect_or_delete_an_outside_part() {
         let d = tempfile::tempdir().unwrap();
-        let elsewhere = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
         let probe = Probe::default();
         let mut g = Guarded::new(probe.clone(), d.path().to_path_buf());
         let dest = d.path().join("Other").join("a.bin");
         g.submit(&request(&dest)).unwrap();
         *probe.state.borrow_mut() = Some(EngineStatus::Done);
-        let (cat, out) = (d.path().join("Other"), elsewhere.path().to_path_buf());
+        let (cat, moved) = (d.path().join("Other"), d.path().join("moved"));
+        let sentinel = outside.path().join("a.bin.velqra-part");
+        std::fs::write(&sentinel, b"not ours").unwrap();
         g.before_publish = Some(Box::new(move || {
-            // the swap: the real folder goes, a junction to somewhere else takes its name, and the
-            // somewhere else already holds a file called like the part file
-            std::fs::remove_dir_all(&cat).unwrap();
-            junction(&cat, &out);
-            std::fs::write(out.join("a.bin.velqra-part"), b"decoy that is not ours").unwrap();
+            assert!(std::fs::rename(&cat, &moved).is_err());
         }));
-        assert_eq!(
-            g.status("t1-g1"),
-            Ok(EngineStatus::Failed("transfer failed".into()))
-        );
-        assert_eq!(g.finished("t1-g1"), Some(false));
-        assert_eq!(
-            std::fs::read(elsewhere.path().join("a.bin.velqra-part")).unwrap(),
-            b"decoy that is not ours",
-            "a file that is not ours was deleted through the swapped folder"
-        );
+        assert_eq!(g.status("t1-g1"), Ok(EngineStatus::Done));
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"not ours");
+        assert!(!outside.path().join("a.bin").exists());
     }
 
     #[test]
@@ -871,8 +1067,8 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let probe = Probe::default();
         let mut g = Guarded::new(probe.clone(), d.path().to_path_buf());
-        // an unknown attempt (for example after a restart) has no recorded destination: pass through
+        // No guard identity means no unvalidated engine result may be adopted.
         *probe.state.borrow_mut() = Some(EngineStatus::Paused);
-        assert_eq!(g.status("never-submitted"), Ok(EngineStatus::Paused));
+        assert_eq!(g.status("never-submitted"), Ok(EngineStatus::Unknown));
     }
 }
