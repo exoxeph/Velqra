@@ -32,9 +32,11 @@ test('local options page does not ask permission until the button click and uses
   let requests = 0, click;
   const button = { disabled: false, addEventListener(name, fn) { assert.equal(name, 'click'); click = fn; } };
   const result = { textContent: '' };
-  globalThis.document = { getElementById: id => id === 'check' ? button : result };
-  globalThis.chrome = { permissions: { request: async () => { requests++; return false; } }, management: { getAll: async () => { throw Error('must not enumerate'); } } };
+  const status = { children: [], replaceChildren() { this.children=[]; }, append(x) { this.children.push(x); } };
+  globalThis.document = { getElementById: id => id === 'check' ? button : id === 'capture-status' ? status : result, createElement: () => ({textContent:''}) };
+  globalThis.chrome = { storage: {session:{get:async()=>({'velqra-capture-diagnostics-v1':[{id:7,reason:'credentials',event:'decision'}]})},onChanged:{addListener(){}}}, permissions: { request: async () => { requests++; return false; } }, management: { getAll: async () => { throw Error('must not enumerate'); } } };
   await import('../src/options.js'); assert.equal(requests, 0);
+  assert.match(status.children[0].textContent,/Download 7: credentials/);
   const pending = click(); assert.equal(requests, 1); assert.equal(button.disabled, true); await pending;
   assert.equal(button.disabled, false); assert.match(result.textContent, /declined/);
 });

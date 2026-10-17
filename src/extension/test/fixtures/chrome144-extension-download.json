@@ -1,0 +1,18 @@
+{
+  "source": "handoffs/from-codex/36-evidence/selftest-2026-10-16T16-45-22-845Z/api-observation.json",
+  "browser": "Chrome/144.0.7559.110",
+  "operation": "Actual downloads.download from the extension worker; no context handler invocation",
+  "urlsRedacted": true,
+  "events": [],
+  "usableHeadersObserved": false,
+  "item": {
+    "id": 2,
+    "url": "https://redacted.test/extension-download.zip",
+    "finalUrl": "https://redacted.test/extension-download.zip",
+    "startTime": "2026-10-16T16:45:28.793Z",
+    "byExtensionId": "lclcokjjakhkabiokkmoaggpdlpaleaf",
+    "state": "complete",
+    "danger": "safe",
+    "totalBytes": 104857600
+  }
+}

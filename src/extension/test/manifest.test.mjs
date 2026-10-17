@@ -79,7 +79,7 @@ test('the worker registers its listeners synchronously and starts the bridge', a
     storage: { local: { get: async () => ({}), set: async () => {} } },
     alarms: { create: () => {}, onAlarm: { addListener: () => listeners.onAlarm++ } },
     downloads: { onCreated: event(), onChanged: event(), onDeterminingFilename: event(), search: async () => [] },
-    webRequest: Object.fromEntries(['onBeforeRequest', 'onBeforeSendHeaders', 'onBeforeRedirect', 'onCompleted', 'onErrorOccurred'].map(k => [k, event()])),
+    webRequest: Object.fromEntries(['onBeforeRequest', 'onBeforeSendHeaders', 'onBeforeRedirect', 'onHeadersReceived', 'onCompleted', 'onErrorOccurred'].map(k => [k, event()])),
     action: { onClicked: event(), setTitle: async () => {}, setBadgeText: async () => {} },
     contextMenus: { onClicked: event() },
   };

@@ -24,7 +24,7 @@ export class CaptureAgent {
   #loading = false;
   /** @param {any} deps */
   constructor(deps) {
-    this.d = { now: Date.now, setTimer: setTimeout, clearTimer: clearTimeout, stepTimeoutMs: 1000, preCancelMs: 5000, onStatus: () => {}, ...deps };
+    this.d = { now: Date.now, setTimer: (fn, ms) => setTimeout(fn, ms), clearTimer: id => clearTimeout(id), stepTimeoutMs: 1000, preCancelMs: 5000, onStatus: () => {}, ...deps };
   }
   get liveOperations() { return this.#live; }
   /** Bounded, metadata-only view, including unresolved records and storage hold. */
@@ -42,6 +42,8 @@ export class CaptureAgent {
   }
   #safe(f, b, paused) {
     const expected = f.expected;
+    if (b?.state === 'complete') throw Error('already_complete');
+    if (paused && b?.state === 'in_progress' && b.paused !== true) throw Error('pause_failed');
     if (!b || b.id !== expected.id || b.state !== 'in_progress' || !!b.paused !== paused
       || b.danger !== 'safe' || b.error || b.policyBlocked === true
       || (b.finalUrl || b.url) !== expected.url || b.filename !== expected.filename
@@ -149,7 +151,7 @@ export class CaptureAgent {
           }
         }
       }));
-    } catch { expired = true; throw Error('pause'); }
+    } catch { expired = true; throw Error('pause_failed'); }
   }
   async #abort(/** @type {any} */ f) {
     // Local fence first; every late success belongs to a dead flow. No cancel on this path.
@@ -199,7 +201,7 @@ export class CaptureAgent {
   /**
    * requestId must be a collision-free installation/profile/download/start-time identity
    * supplied by the future capture adapter. IDs are never invented from URL alone.
-   * @param {any} item @param {any} settings @param {any} context @param {{requestId: string}} opts
+   * @param {any} item @param {any} settings @param {any} context @param {{requestId: string, browserOrigin?: string}} opts
    */
   async capture(item, settings, context, opts) {
     const decision = decide(item, settings, { ...context, appReady: context?.appReady === true && this.d.bridge.state === 'ready' });
@@ -215,7 +217,7 @@ export class CaptureAgent {
       }
     } catch { /* omit invalid optional metadata */ }
     if (typeof context.user_agent === 'string' && /^[\x20-\x7e]{1,512}$/.test(context.user_agent)) wireContext.user_agent = context.user_agent;
-    const expected = { id: item.id, url: item.finalUrl || item.url, filename: item.filename, byExtensionId: item.byExtensionId, startTime: item.startTime };
+    const expected = { id: item.id, url: item.finalUrl || item.url, filename: item.filename, byExtensionId: opts.browserOrigin ?? item.byExtensionId, startTime: item.startTime };
     item = { id: item.id, url: item.url, filename: item.filename.split(/[\\/]/).pop() };
     opts = { requestId: opts.requestId };
     context = null;
@@ -261,8 +263,10 @@ export class CaptureAgent {
       if (b?.state !== 'interrupted' || b.error !== 'USER_CANCELED') return await this.#reconcile(f);
       await this.#save(f, 'CancelConfirmed'); this.#check(f, false);
       return await this.#commit(f);
-    } catch {
-      return f.post ? await this.#reconcile(f) : await this.#abort(f);
+    } catch (error) {
+      const result = f.post ? await this.#reconcile(f) : await this.#abort(f);
+      const diagnostic = f.post ? 'reconcile' : ({ engine: 'engine_not_capable', offline: 'not_ready', already_complete: 'already_complete', pause_failed: 'pause_failed', browser_changed: 'browser_changed' })[error?.message] ?? 'capture_error';
+      return { ...result, diagnostic };
     } finally { this.#flows.delete(item.id); }
   }
   async #commit(/** @type {any} */ f) {

@@ -30,11 +30,12 @@ function setup(options = {}) {
   const log = [], values = {}, items = new Map();
   const chrome = {
     runtime: { id: 'v'.repeat(32), onInstalled: event(), openOptionsPage: async () => { log.push('options'); } },
-    storage: { local: { get: async k => ({ [k]: values[k] }), set: async v => { Object.assign(values, structuredClone(v)); } } },
+    storage: { local: { get: async k => ({ [k]: values[k] }), set: async v => { Object.assign(values, structuredClone(v)); } },
+      session: { get: async k => ({ [k]: values[k] }), set: async v => { Object.assign(values, structuredClone(v)); } } },
     downloads: { onCreated: event(), onChanged: event(), onDeterminingFilename: event(),
       pause: async id => { log.push(['pause', id]); }, resume: async id => { log.push(['resume', id]); }, cancel: async id => { log.push(['cancel', id]); },
       search: async ({ id }) => items.has(id) ? [items.get(id)] : [], download: async o => { log.push(['download', o]); return 99; } },
-    webRequest: Object.fromEntries(['onBeforeRequest', 'onBeforeSendHeaders', 'onBeforeRedirect', 'onCompleted', 'onErrorOccurred'].map(k => [k, event()])),
+    webRequest: Object.fromEntries(['onBeforeRequest', 'onBeforeSendHeaders', 'onBeforeRedirect', 'onHeadersReceived', 'onCompleted', 'onErrorOccurred'].map(k => [k, event()])),
     action: { onClicked: event(), setTitle: async o => log.push(['title', o.title]), setBadgeText: async o => log.push(['badge', o.text]) },
     contextMenus: { onClicked: event(), create: o => log.push(['menu', o]) },
   };
@@ -46,6 +47,7 @@ function setup(options = {}) {
     const d = { requestId: 'r1', url: i.url, method: 'GET', tabId: 3, frameId: 0, documentId: 'doc1', timeStamp: Date.parse(i.startTime), type: 'main_frame', ...extra };
     chrome.webRequest.onBeforeRequest.fire(d);
     chrome.webRequest.onBeforeSendHeaders.fire({ ...d, requestHeaders: [] });
+    chrome.webRequest.onHeadersReceived.fire(d);
     items.set(i.id, i);
     chrome.downloads.onCreated.fire(i);
     return d;
@@ -92,6 +94,7 @@ test('redirects use finalUrl for prepare and all hops must have clean headers', 
     f.chrome.webRequest.onBeforeRedirect.fire({ ...d, redirectUrl: i.finalUrl });
     f.chrome.webRequest.onBeforeRequest.fire({ ...d, url: i.finalUrl });
     f.chrome.webRequest.onBeforeSendHeaders.fire({ ...d, url: i.finalUrl, requestHeaders: [] });
+    f.chrome.webRequest.onHeadersReceived.fire({ ...d, url: i.finalUrl });
     f.items.set(i.id, i);
     await f.filename(i); const call = f.log.find(x => x[0] === 'capture');
     assert.equal(!!call, !credential); if (call) assert.equal(call[1].url, i.finalUrl);
@@ -133,7 +136,7 @@ test('stable installation/profile/download/start-time request identity survives 
   await second.refresh();
   // Drive only the second adapter's listeners; a worker restart has no old listeners.
   const d = { requestId: 'new', url: i.url, method: 'GET', tabId: 3, frameId: 0, type: 'main_frame', timeStamp: Date.parse(i.startTime) };
-  f.chrome.webRequest.onBeforeRequest.listeners.at(-1)(d); f.chrome.webRequest.onBeforeSendHeaders.listeners.at(-1)({ ...d, requestHeaders: [] });
+  f.chrome.webRequest.onBeforeRequest.listeners.at(-1)(d); f.chrome.webRequest.onBeforeSendHeaders.listeners.at(-1)({ ...d, requestHeaders: [] });f.chrome.webRequest.onHeadersReceived.listeners.at(-1)(d);
   f.chrome.downloads.onCreated.listeners.at(-1)(i); f.chrome.downloads.onDeterminingFilename.listeners.at(-1)(i, () => {}); await tick();
   assert.equal(f.log.filter(x => x[0] === 'capture').at(-1)[4].requestId, a);
 });
@@ -163,13 +166,166 @@ test('settings reply identity and mode fail closed; cached version advances only
   }
 });
 
-test('manual entry refuses unsupported/unseen links with a short visible notice; no permission request', async () => {
+test('manual entry starts unseen http links and refuses unsupported schemes visibly', async () => {
   const f = setup(); await f.app.refresh();
   for (const linkUrl of ['javascript:alert(1)', 'https://files.test/unseen.zip', 'https://files.test/a.txt']) f.chrome.contextMenus.onClicked.fire({ menuItemId: 'velqra-download', linkUrl, frameId: 0 }, { id: 3 });
-  await tick(); assert.equal(f.log.some(x => x[0] === 'download'), false); assert.ok(f.log.some(x => x[0] === 'title' && x[1].includes('browser')));
+  await tick(); assert.equal(f.log.filter(x => x[0] === 'download').length, 2); assert.ok(f.log.some(x => x[0] === 'title' && x[1].includes('scheme')));
 });
 
 export { setup, item, tick, settings };
+
+const diagnosticKey = 'velqra-capture-diagnostics-v1';
+
+test('manual Chrome request without webRequest evidence remains in Chrome with a visible notice',async()=>{
+  const f=setup();await f.app.refresh();f.chrome.downloads.download=async()=>99;
+  f.chrome.contextMenus.onClicked.fire({menuItemId:'velqra-download',linkUrl:item().url},{id:3});await tick();
+  const i=item({id:99,byExtensionId:f.chrome.runtime.id});f.items.set(i.id,i);f.chrome.downloads.onCreated.fire(i);await f.filename(i);
+  assert.equal(f.log.some(x=>['capture','pause','cancel'].includes(x[0])),false);
+  assert.ok(f.log.some(x=>x[0]==='title'&&x[1].includes('unseen_request')));
+});
+
+test('manual pending API calls count toward the cap and late timeout results cannot authorize ownership',async()=>{
+  const f=setup({timeoutMs:100});await f.app.refresh();const resolve=[];
+  f.chrome.downloads.download=()=>new Promise(r=>resolve.push(r));
+  for(let n=0;n<17;n++)f.chrome.contextMenus.onClicked.fire({menuItemId:'velqra-download',linkUrl:item().url},{id:3});
+  await tick();assert.equal(resolve.length,16);
+  await new Promise(r=>setTimeout(r,120));for(const r of resolve)r(99);await tick();
+  const i=item({id:99,byExtensionId:f.chrome.runtime.id});f.observe(i,{tabId:-1,frameId:-1,type:'other',statusCode:200});await f.filename(i);
+  assert.equal(f.log.some(x=>x[0]==='capture'),false);assert.equal(f.app.status().manual,0);
+});
+test('manual entry starts an unseen http link and captures only its exact live no-tab request, including early filename events',async()=>{
+  const f=setup();await f.app.refresh();
+  f.chrome.downloads.download=async()=>{
+    const i=item({id:99,byExtensionId:f.chrome.runtime.id});
+    f.observe(i,{requestId:'manual-live',tabId:-1,frameId:-1,type:'other',statusCode:200});
+    f.chrome.downloads.onDeterminingFilename.fire(i,()=>{});
+    return 99;
+  };
+  f.chrome.contextMenus.onClicked.fire({menuItemId:'velqra-download',linkUrl:item().url},{id:3});await tick();
+  assert.equal(f.log.filter(x=>x[0]==='capture').length,1);
+});
+test('manual live no-tab request preserves the real browser extension identity through the ownership agent',async()=>{
+  const f=realSetup();await f.app.refresh();f.chrome.downloads.download=async()=>99;
+  f.chrome.contextMenus.onClicked.fire({menuItemId:'velqra-download',linkUrl:item().url},{id:3});await tick();
+  const i=item({id:99,byExtensionId:f.chrome.runtime.id});f.observe(i,{requestId:'real-manual',tabId:-1,frameId:-1,type:'other',statusCode:200});await f.filename(i);await tick();
+  assert.equal(f.values['velqra-capture-v1']?.records.find(r=>r.id===99)?.state,'HandedOff');
+});
+for(const header of ['Cookie','Authorization','Proxy-Authorization'])test('manual live request keeps '+header+' in Chrome',async()=>{
+  const f=setup();await f.app.refresh();let started=false;
+  f.chrome.downloads.download=async()=>{started=true;return 99;};
+  f.chrome.contextMenus.onClicked.fire({menuItemId:'velqra-download',linkUrl:item().url},{id:3});await tick();
+  const i=item({id:99,byExtensionId:f.chrome.runtime.id});
+  const d=f.observe(i,{requestId:'manual-private',tabId:-1,frameId:-1,type:'other',statusCode:200});
+  f.chrome.webRequest.onBeforeSendHeaders.fire({...d,requestHeaders:[{name:header,value:'PRIVATE'}]});
+  await f.filename(i);
+  assert.equal(started,true);assert.equal(f.log.some(x=>x[0]==='capture'),false);
+  assert.ok(f.log.some(x=>x[0]==='title'&&x[1].includes('credentials')));
+});
+for(const credential of [false,true])test('manual redirect requires clean headers on every hop: credential='+credential,async()=>{
+  const f=setup();await f.app.refresh();f.chrome.downloads.download=async()=>99;
+  f.chrome.contextMenus.onClicked.fire({menuItemId:'velqra-download',linkUrl:item().url},{id:3});await tick();
+  const i=item({id:99,byExtensionId:f.chrome.runtime.id,finalUrl:'https://cdn.test/final.zip'});
+  const d=f.observe(i,{requestId:'manual-redirect',tabId:-1,frameId:-1,type:'other',statusCode:302});
+  if(credential)f.chrome.webRequest.onBeforeSendHeaders.fire({...d,requestHeaders:[{name:'Cookie',value:'PRIVATE'}]});
+  f.chrome.webRequest.onBeforeRedirect.fire({...d,redirectUrl:i.finalUrl});
+  f.chrome.webRequest.onBeforeRequest.fire({...d,url:i.finalUrl});
+  f.chrome.webRequest.onBeforeSendHeaders.fire({...d,url:i.finalUrl,requestHeaders:[]});
+  f.chrome.webRequest.onHeadersReceived.fire({...d,url:i.finalUrl,statusCode:200});
+  await f.filename(i);assert.equal(f.log.some(x=>x[0]==='capture'),!credential);
+});
+test('manual intent expiry during filename preflight prevents agent admission',async()=>{
+  let now=0;const f=setup({now:()=>now});await f.app.refresh();f.chrome.downloads.download=async()=>99;
+  f.chrome.contextMenus.onClicked.fire({menuItemId:'velqra-download',linkUrl:item().url},{id:3});await tick();
+  const i=item({id:99,byExtensionId:f.chrome.runtime.id});f.observe(i,{requestId:'manual-expiry',tabId:-1,frameId:-1,type:'other',statusCode:200});
+  f.chrome.downloads.search=async()=>{now=60001;return [i];};await f.filename(i);
+  assert.equal(f.log.some(x=>x[0]==='capture'),false);
+});
+for(const fault of ['expired','wrong-id','reused','no-intent','bad-status','missing-response'])test('manual intent fails closed: '+fault,async()=>{
+  let now=0;const f=setup({now:()=>now});await f.app.refresh();
+  f.chrome.downloads.download=async()=>99;
+  if(fault!=='no-intent'){f.chrome.contextMenus.onClicked.fire({menuItemId:'velqra-download',linkUrl:item().url},{id:3});await tick();}
+  if(fault==='expired')now=60001;
+  const i=item({id:fault==='wrong-id'?98:99,byExtensionId:f.chrome.runtime.id});
+  if(fault==='missing-response'){
+    const d={requestId:'manual-guard',url:i.url,timeStamp:Date.parse(i.startTime),method:'GET',type:'other',tabId:-1,frameId:-1};
+    f.chrome.webRequest.onBeforeRequest.fire(d);f.chrome.webRequest.onBeforeSendHeaders.fire({...d,requestHeaders:[]});f.items.set(i.id,i);f.chrome.downloads.onCreated.fire(i);
+  }else f.observe(i,{requestId:'manual-guard',tabId:-1,frameId:-1,type:'other',statusCode:fault==='bad-status'?404:200});
+  await f.filename(i);
+  if(fault==='reused'){
+    assert.equal(f.log.filter(x=>x[0]==='capture').length,1);f.log.length=0;
+    const second=item({id:100,byExtensionId:f.chrome.runtime.id});f.observe(second,{requestId:'manual-second',tabId:-1,frameId:-1,type:'other',statusCode:200});await f.filename(second);
+  }
+  assert.equal(f.log.some(x=>x[0]==='capture'),false);
+});
+for (const [scenario, expected] of [['unseen','unseen_request'], ['ambiguous','ambiguous_request'], ['cookie','credentials'], ['off','mode_off'], ['suffix','ineligible_suffix'], ['offline','not_ready']]) test('capture diagnostic explains '+scenario+' without private metadata', async () => {
+  const f=setup();
+  if(scenario==='off'){const request=f.bridge.request;f.bridge.request=async(...a)=>{const e=await request(...a);e.body.payload.mode='off';return e;};}
+  await f.app.refresh(); const i=item(scenario==='suffix'?{filename:'private.txt'}:{});
+  if(scenario==='unseen')f.chrome.downloads.onCreated.fire(i);else{
+    const d=f.observe(i);
+    if(scenario==='ambiguous')f.observe(i,{requestId:'r2'});
+    if(scenario==='cookie')f.chrome.webRequest.onBeforeSendHeaders.fire({...d,requestHeaders:[{name:'Cookie',value:'PRIVATE_HEADER'}]});
+  }
+  if(scenario==='offline')f.bridge.state='closed'; await f.filename(i);
+  const rows=f.values[diagnosticKey];assert.ok(Array.isArray(rows));
+  const r=rows.filter(x=>x.id===i.id&&x.decision==='keep').at(-1);assert.equal(r?.reason,expected);assert.equal(typeof r.candidateCount,'number');
+  assert.ok(f.log.some(x=>x[0]==='title'&&x[1].includes(expected)));
+  assert.doesNotMatch(JSON.stringify(rows),/files.test|PRIVATE_HEADER|private.txt|r1/);
+  f.chrome.downloads.onChanged.fire({id:i.id,state:{current:'complete'}});await tick();assert.equal(f.values[diagnosticKey].at(-1).reason,expected);
+});
+test('diagnostics distinguish confirmed capture, failed pause and already complete',async()=>{
+  for(const scenario of ['captured','pause_failed','already_complete']){
+    const f=realSetup();await f.app.refresh();
+    if(scenario==='pause_failed')f.chrome.downloads.pause=async()=>{throw Error('PRIVATE_API_ERROR');};
+    if(scenario==='already_complete')f.chrome.downloads.pause=async()=>{f.items.get(7).state='complete';};
+    f.observe();await f.filename();await tick();
+    assert.equal(f.values[diagnosticKey].filter(x=>x.event==='decision').at(-1)?.reason,scenario);
+  }
+});
+test('diagnostics cap records at 50 and storage failure cannot block suggest or capture',async()=>{
+  const f=setup();await f.app.refresh();for(let id=0;id<80;id++)f.chrome.downloads.onCreated.fire(item({id,url:`https://other.test/${id}.zip`}));await tick();assert.equal(f.values[diagnosticKey].length,50);
+  f.chrome.storage.session.set=async()=>{throw Error('PRIVATE');};f.observe(item({id:99}));assert.equal((await f.filename(item({id:99}))).calls,1);assert.equal(f.log.filter(x=>x[0]==='capture').length,1);
+});
+
+test('Chrome worker timers reject an arbitrary receiver: real journal and agent still hand off',async()=>{
+  const set=globalThis.setTimeout, clear=globalThis.clearTimeout;
+  let illegal=0;
+  globalThis.setTimeout=function(...args){if(this!==undefined&&this!==globalThis){illegal++;throw TypeError('Illegal invocation');}return set(...args);};
+  globalThis.clearTimeout=function(...args){if(this!==undefined&&this!==globalThis){illegal++;throw TypeError('Illegal invocation');}return clear(...args);};
+  try {
+    const f=realSetup();await f.app.refresh();f.observe();await f.filename();
+    assert.equal(illegal,0);
+    assert.equal(f.values['velqra-capture-v1']?.records[0]?.state,'HandedOff');
+  } finally {globalThis.setTimeout=set;globalThis.clearTimeout=clear;}
+});
+
+test('Chrome filename lifecycle: proposed basename precedes empty search name and finalized unique path',async()=>{
+  const f=realSetup();await f.app.refresh();const i=item({filename:'',paused:false});f.observe(i);
+  const search=f.chrome.downloads.search;let calls=0;
+  f.chrome.downloads.search=async q=>{
+    if(++calls===2){i.filename='C:\\Downloads\\a (1).zip';f.chrome.downloads.onChanged.fire({id:i.id,filename:{current:i.filename}});}
+    return search(q);
+  };
+  await f.filename({...i,filename:'a.zip'});await new Promise(r=>setTimeout(r,60));await tick();
+  assert.equal(f.values['velqra-capture-v1']?.records[0]?.state,'HandedOff');
+  assert.equal(f.log.find(x=>x[0]==='wire'&&x[1]==='prepare')?.[2].filename,'a (1).zip');
+});
+
+test('a finalized leading-dot name stays with Chrome despite the proposed zip suffix',async()=>{
+  const f=realSetup();await f.app.refresh();const i=item({filename:'.zip'});f.observe(i);
+  await f.filename({...i,filename:'a.zip'});
+  assert.equal(f.log.some(x=>x[0]==='pause'||x[0]==='cancel'),false);
+  assert.equal(f.values[diagnosticKey].filter(x=>x.event==='decision').at(-1)?.reason,'ineligible_suffix');
+});
+
+test('a target path without the browser filename confirmation has a bounded wait and never pauses',async()=>{
+  const f=realSetup();await f.app.refresh();const i=item({filename:''});f.observe(i);
+  f.items.set(i.id,{...i,filename:'C:\\Downloads\\a.zip'});
+  await f.filename({...i,filename:'a.zip'});await new Promise(r=>setTimeout(r,650));await tick();
+  assert.equal(f.log.some(x=>x[0]==='pause'||x[0]==='cancel'),false);
+  assert.equal(f.app.status().active,0);
+  assert.equal(f.values[diagnosticKey].filter(x=>x.event==='decision').at(-1)?.reason,'browser_changed');
+});
 
 for (const [mode, allowed_sites, captures] of [['off', [], false], ['per_site', [], false], ['per_site', ['files.test'], true], ['on', [], true]]) test(`snapshot mode ${mode}/${allowed_sites} is enforced`, async () => {
   const f = setup(); const original = f.bridge.request.bind(f.bridge);
@@ -435,15 +591,14 @@ test('disconnect during storage initialization cannot publish readiness after re
   assert.equal(await pending, false); assert.equal(f.app.status().ready, false);
 });
 
-test('manual checks reject credentials, POST, excluded host, wrong tab/frame and disabled settings', async () => {
-  for (const mode of ['credentials', 'POST', 'excluded', 'tab', 'frame', 'off']) {
+test('manual Chrome starts still enforce live POST, excluded host and disabled settings', async () => {
+  for (const mode of ['POST', 'excluded', 'off']) {
     const f = setup();
     const original = f.bridge.request.bind(f.bridge);
     f.bridge.request = async (...a) => { const e = await original(...a); if (a[0].type === 'settings_get') { if (mode === 'excluded') e.body.payload.excluded_sites = ['files.test']; if (mode === 'off') e.body.payload.mode = 'off'; } return e; };
-    await f.app.refresh(); const d = f.observe(item(), mode === 'POST' ? { method: 'POST' } : {});
-    if (mode === 'credentials') f.chrome.webRequest.onBeforeSendHeaders.fire({ ...d, requestHeaders: [{ name: 'Cookie', value: 'secret' }] });
-    f.chrome.contextMenus.onClicked.fire({ menuItemId: 'velqra-download', linkUrl: item().url, frameId: mode === 'frame' ? 1 : 0 }, { id: mode === 'tab' ? 8 : 3 });
-    await tick(); assert.equal(f.log.some(x => x[0] === 'download'), false); assert.equal(f.app.status().reason, 'manual');
+    await f.app.refresh();f.chrome.contextMenus.onClicked.fire({menuItemId:'velqra-download',linkUrl:item().url},{id:3});await tick();
+    const i=item({id:99,byExtensionId:f.chrome.runtime.id});f.observe(i,{requestId:'new-request',tabId:-1,frameId:-1,type:'other',statusCode:200,...(mode==='POST'?{method:'POST'}:{})});await f.filename(i);
+    assert.equal(f.log.some(x=>x[0]==='download'),true);assert.equal(f.log.some(x=>x[0]==='capture'),false);
   }
 });
 
@@ -454,7 +609,7 @@ test('manual intents have a hard cap, expire, and reject an invalid browser down
   for (let n = 0; n < 25; n++) { click(); await tick(); }
   assert.equal(calls, 16); assert.equal(f.app.status().manual, 16);
   now = 60001; assert.equal(f.app.status().manual, 0);
-  f.chrome.downloads.download = async () => NaN; click(); await tick(); assert.equal(f.app.status().manual, 0); assert.equal(f.app.status().reason, 'manual');
+  f.chrome.downloads.download = async () => NaN; click(); await tick(); assert.equal(f.app.status().manual, 0); assert.equal(f.app.status().reason, 'not_ready');
 });
 
 test('invalid toolbar tab is ignored; duplicate created events never reset a processed download', async () => {
@@ -467,6 +622,7 @@ test('tracker does not borrow evidence from a different original URL and sanitiz
   const t = new RequestTracker(); const i = item(); const d = { requestId: 'r', url: 'https://other.test/a.zip', method: 'GET', tabId: 1, frameId: 0, type: 'main_frame', timeStamp: Date.parse(i.startTime) };
   t.before(d); t.headers({ ...d, requestHeaders: [] }); t.redirect({ ...d, redirectUrl: i.finalUrl });
   t.headers({ ...d, url: i.finalUrl, requestHeaders: [{ name: 'User-Agent', value: 'x'.repeat(1000) }, { name: 'Referer', value: 'https://ref.test/path?secret=never' }] });
+  t.response({ ...d, url: i.finalUrl });
   assert.equal(t.match(i), null);
   const c = t.match({ ...i, url: d.url }); assert.equal(c.user_agent, ''); assert.equal(c.referer, 'https://ref.test/');
 });
@@ -493,18 +649,18 @@ test('per-entry metadata budget rejects oversized new records and fences oversiz
   assert.ok(t.has('r')); assert.notEqual(t.match(i)?.correlated, true);
 });
 
-test('manual no-tab results conservatively stay in browser even with a clean new request', async () => {
+test('manual no-tab results require a clean unique live request with successful response', async () => {
   for (const mode of ['clean', 'cookie', 'missing', 'ambiguous']) {
-    const f = setup(); await f.app.refresh(); f.observe();
+    const f = setup(); await f.app.refresh();
     f.chrome.contextMenus.onClicked.fire({ menuItemId: 'velqra-download', linkUrl: item().url, frameId: 0 }, { id: 3 }); await tick();
     const i = item({ id: 99, byExtensionId: f.chrome.runtime.id });
     if (mode === 'missing') f.chrome.downloads.onCreated.fire(i);
     else {
-      const d = f.observe(i, { requestId: 'new-manual', tabId: -1 });
+      const d = f.observe(i, { requestId: 'new-manual', tabId: -1, frameId:-1,type:'other',statusCode:200 });
       if (mode === 'cookie') f.chrome.webRequest.onBeforeSendHeaders.fire({ ...d, requestHeaders: [{ name: 'Cookie', value: 'secret' }] });
       if (mode === 'ambiguous') f.observe(item({ id: 100 }), { requestId: 'third', tabId: -1 });
     }
-    await f.filename(i); const calls = f.log.filter(x => x[0] === 'capture'); assert.equal(calls.length, 0);
+    await f.filename(i); const calls = f.log.filter(x => x[0] === 'capture'); assert.equal(calls.length, mode==='clean'?1:0);
   }
 });
 

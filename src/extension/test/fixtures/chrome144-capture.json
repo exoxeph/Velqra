@@ -1,0 +1,265 @@
+[
+  {
+    "label": "A",
+    "events": [
+      {
+        "event": "onBeforeRequest",
+        "data": {
+          "frameId": 0,
+          "method": "GET",
+          "timeStamp": 1792164826779.411,
+          "type": "main_frame",
+          "requestId": "request-1",
+          "tabId": 1,
+          "url": "https://redacted.test/file-0.zip"
+        }
+      },
+      {
+        "event": "onBeforeSendHeaders",
+        "data": {
+          "credentialHeader": false,
+          "frameId": 0,
+          "method": "GET",
+          "timeStamp": 1792164826779.703,
+          "type": "main_frame",
+          "requestId": "request-1",
+          "tabId": 1,
+          "url": "https://redacted.test/file-0.zip"
+        }
+      },
+      {
+        "event": "onHeadersReceived",
+        "data": {
+          "frameId": 0,
+          "method": "GET",
+          "timeStamp": 1792164826782.447,
+          "type": "main_frame",
+          "requestId": "request-1",
+          "tabId": 1,
+          "url": "https://redacted.test/file-0.zip"
+        }
+      }
+    ],
+    "item": {
+      "danger": "safe",
+      "paused": false,
+      "startTime": "2026-10-16T15:33:46.784Z",
+      "state": "in_progress",
+      "totalBytes": 104857600,
+      "id": 7,
+      "url": "https://redacted.test/file-0.zip",
+      "finalUrl": "https://redacted.test/file-0.zip",
+      "filename": "file.zip"
+    }
+  },
+  {
+    "label": "B",
+    "events": [
+      {
+        "event": "onBeforeRequest",
+        "data": {
+          "frameId": 0,
+          "method": "GET",
+          "timeStamp": 1792164830137.287,
+          "type": "main_frame",
+          "requestId": "request-1",
+          "tabId": 1,
+          "url": "https://redacted.test/file-0.zip"
+        }
+      },
+      {
+        "event": "onBeforeSendHeaders",
+        "data": {
+          "credentialHeader": false,
+          "frameId": 0,
+          "method": "GET",
+          "timeStamp": 1792164830137.561,
+          "type": "main_frame",
+          "requestId": "request-1",
+          "tabId": 1,
+          "url": "https://redacted.test/file-0.zip"
+        }
+      },
+      {
+        "event": "onHeadersReceived",
+        "data": {
+          "frameId": 0,
+          "method": "GET",
+          "timeStamp": 1792164830140.348,
+          "type": "main_frame",
+          "requestId": "request-1",
+          "tabId": 1,
+          "url": "https://redacted.test/file-0.zip"
+        }
+      },
+      {
+        "event": "onBeforeRedirect",
+        "data": {
+          "frameId": 0,
+          "fromCache": false,
+          "method": "GET",
+          "timeStamp": 1792164830140.626,
+          "type": "main_frame",
+          "requestId": "request-1",
+          "tabId": 1,
+          "url": "https://redacted.test/file-0.zip",
+          "redirectUrl": "https://redacted.test/file-1.zip"
+        }
+      },
+      {
+        "event": "onBeforeRequest",
+        "data": {
+          "frameId": 0,
+          "method": "GET",
+          "timeStamp": 1792164830141.234,
+          "type": "main_frame",
+          "requestId": "request-1",
+          "tabId": 1,
+          "url": "https://redacted.test/file-1.zip"
+        }
+      },
+      {
+        "event": "onBeforeSendHeaders",
+        "data": {
+          "credentialHeader": false,
+          "frameId": 0,
+          "method": "GET",
+          "timeStamp": 1792164830141.452,
+          "type": "main_frame",
+          "requestId": "request-1",
+          "tabId": 1,
+          "url": "https://redacted.test/file-1.zip"
+        }
+      },
+      {
+        "event": "onHeadersReceived",
+        "data": {
+          "frameId": 0,
+          "method": "GET",
+          "timeStamp": 1792164830142.734,
+          "type": "main_frame",
+          "requestId": "request-1",
+          "tabId": 1,
+          "url": "https://redacted.test/file-1.zip"
+        }
+      }
+    ],
+    "item": {
+      "danger": "safe",
+      "paused": false,
+      "startTime": "2026-10-16T15:33:50.145Z",
+      "state": "in_progress",
+      "totalBytes": 104857600,
+      "id": 7,
+      "url": "https://redacted.test/file-0.zip",
+      "finalUrl": "https://redacted.test/file-1.zip",
+      "filename": "file.zip"
+    }
+  },
+  {
+    "label": "E-present",
+    "events": [
+      {
+        "event": "onBeforeRequest",
+        "data": {
+          "frameId": 0,
+          "method": "GET",
+          "timeStamp": 1792164835535.096,
+          "type": "main_frame",
+          "requestId": "request-1",
+          "tabId": 1,
+          "url": "https://redacted.test/file-0.zip"
+        }
+      },
+      {
+        "event": "onBeforeSendHeaders",
+        "data": {
+          "credentialHeader": false,
+          "frameId": 0,
+          "method": "GET",
+          "timeStamp": 1792164835537.051,
+          "type": "main_frame",
+          "requestId": "request-1",
+          "tabId": 1,
+          "url": "https://redacted.test/file-0.zip"
+        }
+      },
+      {
+        "event": "onHeadersReceived",
+        "data": {
+          "frameId": 0,
+          "method": "GET",
+          "timeStamp": 1792164835538.688,
+          "type": "main_frame",
+          "requestId": "request-1",
+          "tabId": 1,
+          "url": "https://redacted.test/file-0.zip"
+        }
+      }
+    ],
+    "item": {
+      "danger": "safe",
+      "paused": false,
+      "startTime": "2026-10-16T15:33:55.541Z",
+      "state": "in_progress",
+      "totalBytes": 104857600,
+      "id": 7,
+      "url": "https://redacted.test/file-0.zip",
+      "finalUrl": "https://redacted.test/file-0.zip",
+      "filename": "file.zip"
+    }
+  },
+  {
+    "label": "H",
+    "events": [
+      {
+        "event": "onBeforeRequest",
+        "data": {
+          "frameId": 0,
+          "method": "GET",
+          "timeStamp": 1792164840350.432,
+          "type": "main_frame",
+          "requestId": "request-1",
+          "tabId": 1,
+          "url": "https://redacted.test/file-0.zip"
+        }
+      },
+      {
+        "event": "onBeforeSendHeaders",
+        "data": {
+          "credentialHeader": false,
+          "frameId": 0,
+          "method": "GET",
+          "timeStamp": 1792164840358.539,
+          "type": "main_frame",
+          "requestId": "request-1",
+          "tabId": 1,
+          "url": "https://redacted.test/file-0.zip"
+        }
+      },
+      {
+        "event": "onHeadersReceived",
+        "data": {
+          "frameId": 0,
+          "method": "GET",
+          "timeStamp": 1792164840361.093,
+          "type": "main_frame",
+          "requestId": "request-1",
+          "tabId": 1,
+          "url": "https://redacted.test/file-0.zip"
+        }
+      }
+    ],
+    "item": {
+      "danger": "safe",
+      "paused": false,
+      "startTime": "2026-10-16T15:34:00.364Z",
+      "state": "in_progress",
+      "totalBytes": 104857600,
+      "id": 7,
+      "url": "https://redacted.test/file-0.zip",
+      "finalUrl": "https://redacted.test/file-0.zip",
+      "filename": "file.zip"
+    }
+  }
+]

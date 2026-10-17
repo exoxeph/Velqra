@@ -37,7 +37,7 @@ export class Journal {
   #pending = 0;
   /** @param {any} deps */
   constructor(deps) {
-    this.d = { key: 'velqra-capture-v1', maxRecords: 256, maxBytes: 256 * 1024, retentionMs: 30 * 86400000, now: Date.now, timeoutMs: 1000, setTimer: setTimeout, clearTimer: clearTimeout, ...deps };
+    this.d = { key: 'velqra-capture-v1', maxRecords: 256, maxBytes: 256 * 1024, retentionMs: 30 * 86400000, now: Date.now, timeoutMs: 1000, setTimer: (fn, ms) => setTimeout(fn, ms), clearTimer: id => clearTimeout(id), ...deps };
     if (!Number.isSafeInteger(this.d.maxRecords) || this.d.maxRecords < 1 || this.d.maxRecords > 256) throw Error('limits');
   }
   get held() { return this.#poison || this.#failures >= 5; }
